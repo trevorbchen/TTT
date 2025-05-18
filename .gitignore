@@ -174,5 +174,5 @@ docker-compose.override.yml
 /tmp/
 /.cache/
 
-*.pth
+
 *.pt
