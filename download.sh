@@ -4,7 +4,7 @@ gdown https://drive.google.com/uc?id=1BGwhRWUoguF-D8wlZ65tf227gp3cDUDh -O checkp
 
 # ImageNet 256 DDPM
 echo "Downloading ImageNet 256 DDPM model..."
-gdown https://drive.google.com/uc?id=1HAy7P19PckQLczVNXmVF-e_CRxq098uW -O checkpoints/imagenet256ddpm.pt
+gdown https://drive.google.com/uc?id=1HAy7P19PckQLczVNXmVF-e_CRxq098uW -O checkpoints/imagenet256.pt
 
 # FFHQ 256 LDM
 echo "Downloading FFHQ 256 LDM model..."
