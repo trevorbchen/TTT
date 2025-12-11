@@ -179,3 +179,4 @@ docker-compose.override.yml
 
 
 *.pt
+*.pth
