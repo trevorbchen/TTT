@@ -152,11 +152,12 @@ class MCMCSampler(nn.Module):
             cur_score, fitting_loss = self.score_fn(x, x0hat, model, xt, operator, measurement, sigma)
             epsilon = torch.randn_like(x)
 
+            x_prev = x
             x = self.mc_update(x, cur_score, lr, epsilon)
 
-            # early stopping with NaN
+            # early stopping with NaN — return last valid state
             if torch.isnan(x).any():
-                return torch.zeros_like(x) 
+                return x_prev.detach()
 
             # record
             if record:

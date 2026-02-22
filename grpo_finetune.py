@@ -101,7 +101,7 @@ def generate_all_candidates(model, sampler, operator, images, measurements,
 # ---------------------------------------------------------------------------
 
 def grpo_loss_batch(model, lora_modules, candidates, advantages,
-                    lambda_kl=0.0, store=None, y_batch=None):
+                    lambda_kl=0.0, adv_clip=5.0, store=None, y_batch=None):
     """Advantage-weighted DDPM MSE loss on a batch."""
     device = candidates.device
     B = candidates.shape[0]
@@ -121,8 +121,9 @@ def grpo_loss_batch(model, lora_modules, candidates, advantages,
     noise_pred = (x_noisy - D_x) / sigma_bc
     mse_per_sample = (noise_pred - noise).pow(2).mean(dim=[1, 2, 3])
 
-    # advantage-weighted loss
-    policy_loss = (advantages * mse_per_sample).mean()
+    # advantage-weighted loss (clip advantages to prevent instability)
+    clipped_advantages = advantages.clamp(-adv_clip, adv_clip)
+    policy_loss = (clipped_advantages * mse_per_sample).mean()
 
     # optional KL regularization
     kl_loss = torch.tensor(0.0, device=device)
@@ -159,6 +160,7 @@ def main(args: DictConfig):
     num_epochs = cfg.get("num_epochs", 10)
     num_candidates = cfg.get("num_candidates", 6)
     lambda_kl = cfg.get("lambda_kl", 0.0)
+    adv_clip = cfg.get("adv_clip", 5.0)
     grad_clip = cfg.get("grad_clip", 1.0)
     batch_size = cfg.get("train_batch_size", 8)
 
@@ -220,7 +222,7 @@ def main(args: DictConfig):
 
             optimizer.zero_grad()
             loss = grpo_loss_batch(model, lora_modules, c_batch, a_batch,
-                                   lambda_kl=lambda_kl,
+                                   lambda_kl=lambda_kl, adv_clip=adv_clip,
                                    store=store, y_batch=y_batch)
             loss.backward()
             model.requires_grad_(False)

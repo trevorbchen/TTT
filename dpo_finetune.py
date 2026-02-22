@@ -53,43 +53,41 @@ def sample_sigma(model, batch_size, device):
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def generate_all_pairs(model, sampler, operator, images, measurements,
-                       num_candidates=4):
-    """Generate winner/loser pairs for every image in the dataset.
+def generate_all_pairs(model, sampler, operator, images, measurements):
+    """Generate one winner/loser pair for every image in the dataset.
 
-    For each image, runs DPS num_candidates times, ranks by measurement
-    consistency, and pairs best with worst.
+    For each image, runs DPS twice with different seeds, picks the one
+    with lower measurement loss as winner.
 
     Returns:
-        winners: [N_pairs, C, H, W]
-        losers:  [N_pairs, C, H, W]
-        pair_measurements: [N_pairs, C_y, H_y, W_y] — measurement for each pair
+        winners: [N, C, H, W]
+        losers:  [N, C, H, W]
+        pair_measurements: [N, C_y, H_y, W_y] — measurement for each pair
     """
     all_winners, all_losers, all_y = [], [], []
 
     for img_idx in tqdm.trange(len(images), desc="Generating pairs"):
         y_i = measurements[img_idx: img_idx + 1]
-        candidates, losses = [], []
 
-        for _ in range(num_candidates):
-            x_start = sampler.get_start(1, model)
-            with torch.enable_grad():
-                x_hat = sampler.sample(model, x_start, operator, y_i, verbose=False)
-            loss = operator.loss(x_hat, y_i)
-            candidates.append(x_hat)
-            losses.append(loss)
+        # two trajectories with different random seeds
+        x_start_a = sampler.get_start(1, model)
+        with torch.enable_grad():
+            x_hat_a = sampler.sample(model, x_start_a, operator, y_i, verbose=False)
+        loss_a = operator.loss(x_hat_a, y_i)
 
-        candidates = torch.cat(candidates, dim=0)  # [G, C, H, W]
-        losses = torch.cat(losses, dim=0)           # [G]
+        x_start_b = sampler.get_start(1, model)
+        with torch.enable_grad():
+            x_hat_b = sampler.sample(model, x_start_b, operator, y_i, verbose=False)
+        loss_b = operator.loss(x_hat_b, y_i)
 
-        # pair best with worst
-        order = losses.argsort()
-        n_pairs = len(order) // 2
-        w_idx = order[:n_pairs]
-        l_idx = order[-n_pairs:].flip(0)
-        all_winners.append(candidates[w_idx])
-        all_losers.append(candidates[l_idx])
-        all_y.append(y_i.expand(n_pairs, -1, -1, -1))
+        # lower loss = better reconstruction = winner
+        if loss_a.item() <= loss_b.item():
+            all_winners.append(x_hat_a)
+            all_losers.append(x_hat_b)
+        else:
+            all_winners.append(x_hat_b)
+            all_losers.append(x_hat_a)
+        all_y.append(y_i)
 
     return torch.cat(all_winners), torch.cat(all_losers), torch.cat(all_y)
 
@@ -163,7 +161,6 @@ def main(args: DictConfig):
     target_modules = cfg.get("target_modules", "all")
     lr = cfg.get("lr", 1e-4)
     num_epochs = cfg.get("num_epochs", 10)
-    num_candidates = cfg.get("num_candidates", 4)
     beta_dpo = cfg.get("beta_dpo", 5000.0)
     grad_clip = cfg.get("grad_clip", 1.0)
     batch_size = cfg.get("train_batch_size", 4)
@@ -190,9 +187,9 @@ def main(args: DictConfig):
         yaml.safe_dump(OmegaConf.to_container(args, resolve=True), f)
 
     # --- generate pairs (one-time, before LoRA) ---
-    print(f"Generating {num_candidates} candidates per image ({num_images} images)...")
+    print(f"Generating 2 candidates per image ({num_images} images)...")
     winners, losers, pair_y = generate_all_pairs(
-        model, sampler, operator, images, y, num_candidates=num_candidates)
+        model, sampler, operator, images, y)
     num_pairs = len(winners)
     print(f"Total pairs: {num_pairs}")
 

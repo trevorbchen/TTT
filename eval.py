@@ -192,7 +192,7 @@ class StructuralSimilarityIndexMeasure(EvalFn):
 
 @register_eval_fn('lpips')
 class LearnedPerceptualImagePatchSimilarity(EvalFn):
-    cmp = 'min'  # the higher, the better
+    cmp = 'min'  # the lower, the better
 
     def __init__(self, batch_size=128):
         self.batch_size = batch_size
