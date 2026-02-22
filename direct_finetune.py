@@ -1,61 +1,51 @@
 """
-DRaFT-style test-time training (TTT) for DPS.
+DRaFT-style direct finetuning for DPS.
 
-For each test measurement y, fine-tunes the score model's attention layers
-via LoRA so that DPS produces reconstructions with better measurement
-consistency.  The reward signal is R(x0) = -||y - A(x0)||^2, backpropagated
-through the final Tweedie step (ReFL, K=1) or multiple trailing steps
-(DRaFT, K>1).
+Trains LoRA across a dataset of images sharing the same forward operator A(x)
+so the score model learns to internalize measurement guidance:
+    score_lora(x_t) ~ nabla log p(x_t) + nabla log p(y|x_t)
+
+After training, the LoRA-adapted model can reconstruct from measurements
+WITHOUT running DPS guidance gradients at each step -- plain diffusion
+sampling suffices.
+
+Approach: For each training image, run DPS prefix steps (no grad) to get
+near-clean x_t, then backprop the reward signal R = -||y - A(tweedie(x_t))||^2
+through the final Tweedie step into the LoRA weights (ReFL, K=1).
 """
 
 import yaml
 import torch
-import torch.nn as nn
 import numpy as np
 import tqdm
 import hydra
+import matplotlib.pyplot as plt
 from pathlib import Path
 from omegaconf import OmegaConf, DictConfig
-from torchvision.utils import save_image
 
 from forward_operator import get_operator
 from data import get_dataset
 from model import get_model
-from eval import get_eval_fn, Evaluator
 from sampler import get_sampler
 from cores.scheduler import get_diffusion_scheduler
-from lora import apply_lora, remove_lora, get_lora_params, frozen_tweedie
+from lora import (apply_lora, apply_conditioned_lora, remove_lora,
+                  get_lora_params, frozen_tweedie, save_lora)
 
 
 # ---------------------------------------------------------------------------
-# DPS sampling prefix (no-grad) — replicates sampler.py DPS.sample logic
+# DPS sampling prefix (no-grad) -- replicates sampler.py DPS.sample logic
 # ---------------------------------------------------------------------------
 
 def dps_sample_prefix(model, scheduler, guidance_scale, x_start, operator,
                       measurement, num_steps):
-    """Run the first ``num_steps`` of DPS (Euler PF-ODE with guidance).
-
-    This mirrors the loop in :class:`sampler.DPS.sample` but stops early and
-    returns the state so the caller can attach a differentiable Tweedie step.
-
-    Args:
-        model: Diffusion model (DDPM wrapper).
-        scheduler: Diffusion scheduler with sigma_steps etc.
-        guidance_scale: DPS guidance weight.
-        x_start: Initial noisy sample (B, C, H, W).
-        operator: Forward measurement operator.
-        measurement: Observed y (B, …).
-        num_steps: How many Euler steps to run (the *prefix*).
+    """Run the first num_steps of DPS (Euler PF-ODE with guidance).
 
     Returns:
-        tuple: (xt, sigma, st) — current sample, noise level, and scaling
-        at the step right after the prefix ends.
+        (xt, sigma_boundary, st_boundary) at the step after the prefix.
     """
     sigma_steps = scheduler.sigma_steps
-    total_steps = len(sigma_steps) - 1  # last entry is 0
-    assert num_steps <= total_steps, (
-        f"num_steps ({num_steps}) must be <= total DPS steps ({total_steps})"
-    )
+    total_steps = len(sigma_steps) - 1
+    assert num_steps <= total_steps
 
     xt = x_start
     for step in range(num_steps):
@@ -68,7 +58,6 @@ def dps_sample_prefix(model, scheduler, guidance_scale, x_start, operator,
         dst = scheduler.get_scaling_derivative(t)
         dsigma = scheduler.get_sigma_derivative(t)
 
-        # --- guidance gradient (same as DPS.sample) ---
         model.requires_grad_(True)
         xt_in = xt.detach().requires_grad_(True)
         x0hat = model.tweedie(xt_in / st, sigma)
@@ -81,17 +70,14 @@ def dps_sample_prefix(model, scheduler, guidance_scale, x_start, operator,
             norm_factor = norm_factor.clamp(min=1e-8)
             normalized_grad = grad_xt / norm_factor
 
-        # --- PF-ODE Euler step ---
         with torch.no_grad():
             score = (x0hat.detach() - xt / st) / sigma ** 2
             deriv = dst / st * xt - st * dsigma * sigma * score
             xt_next = xt + dt * deriv
             xt = xt_next - guidance_scale * normalized_grad
-
             if torch.isnan(xt).any():
                 break
 
-    # Return the state at the boundary: sigma/st for the *next* step
     sigma_boundary = sigma_steps[num_steps]
     t_boundary = scheduler.get_sigma_inv(sigma_boundary)
     st_boundary = scheduler.get_scaling(t_boundary)
@@ -99,167 +85,11 @@ def dps_sample_prefix(model, scheduler, guidance_scale, x_start, operator,
 
 
 # ---------------------------------------------------------------------------
-# Per-image test-time training
-# ---------------------------------------------------------------------------
-
-@torch.no_grad()
-def dps_final_sample(model, sampler, x_start, operator, measurement):
-    """Full DPS sample using the (possibly LoRA-adapted) model."""
-    return sampler.sample(model, x_start, operator, measurement, verbose=False)
-
-
-def run_ttt(model, sampler, operator, measurement, gt, evaluator,
-            lora_rank=4, lora_alpha=1.0, lr=1e-4, num_ttt_steps=50,
-            lambda_kl=0.01, grad_clip=1.0, K=1, verbose=True):
-    """Test-time train LoRA on the score model for a single measurement.
-
-    Args:
-        model: DDPM diffusion model.
-        sampler: DPS sampler instance (carries scheduler + guidance_scale).
-        operator: Forward operator A.
-        measurement: Observed y, shape (B, …).
-        gt: Ground-truth image (for evaluation only).
-        evaluator: Evaluator instance.
-        lora_rank: LoRA rank.
-        lora_alpha: LoRA alpha scaling.
-        lr: Learning rate for AdamW.
-        num_ttt_steps: Number of TTT optimisation iterations.
-        lambda_kl: Weight on KL (frozen-model) regularisation.
-        grad_clip: Max gradient norm for clipping.
-        K: Number of trailing Tweedie steps with gradient (1 = ReFL).
-        verbose: Print progress.
-
-    Returns:
-        dict with keys 'sample', 'metrics_before', 'metrics_after', 'losses'.
-    """
-    device = next(model.parameters()).device
-    scheduler = sampler.scheduler
-    guidance_scale = sampler.guidance_scale
-    sigma_steps = scheduler.sigma_steps
-    total_dps_steps = len(sigma_steps) - 1
-    prefix_steps = max(total_dps_steps - K, 0)
-
-    # --- baseline (before TTT) ---
-    with torch.no_grad():
-        x_start_eval = sampler.get_start(measurement.shape[0], model)
-        sample_before = dps_final_sample(model, sampler, x_start_eval, operator, measurement)
-        metrics_before = evaluator(gt, measurement, sample_before)
-
-    # --- inject LoRA ---
-    lora_modules = apply_lora(model, rank=lora_rank, alpha=lora_alpha)
-    lora_params = get_lora_params(lora_modules)
-    optimizer = torch.optim.AdamW(lora_params, lr=lr, weight_decay=0.0)
-
-    losses = []
-    pbar = tqdm.trange(num_ttt_steps, desc="TTT") if verbose else range(num_ttt_steps)
-
-    for ttt_step in pbar:
-        optimizer.zero_grad()
-
-        # fresh noise
-        x_T = sampler.get_start(measurement.shape[0], model)
-
-        # --- prefix: run DPS steps without LoRA gradient ---
-        if prefix_steps > 0:
-            xt, sigma_boundary, st_boundary = dps_sample_prefix(
-                model, scheduler, guidance_scale, x_T, operator,
-                measurement, prefix_steps,
-            )
-        else:
-            xt = x_T.detach()
-            sigma_boundary = sigma_steps[0]
-            t_boundary = scheduler.get_sigma_inv(sigma_boundary)
-            st_boundary = scheduler.get_scaling(t_boundary)
-
-        # --- gradient-tracked trailing step(s) ---
-        # For K=1 (ReFL): single Tweedie at the boundary
-        # For K>1 (DRaFT): run K Euler+Tweedie steps with grad
-        if K == 1:
-            # Single Tweedie prediction at the boundary noise level
-            model.requires_grad_(True)
-            x0_hat = model.tweedie(xt / st_boundary, sigma_boundary)
-            model.requires_grad_(False)
-        else:
-            # DRaFT: K trailing PF-ODE steps with gradient
-            xt_grad = xt.requires_grad_(False).clone()
-            for k_step in range(K):
-                step_idx = prefix_steps + k_step
-                if step_idx >= total_dps_steps:
-                    break
-                sigma = sigma_steps[step_idx]
-                sigma_next = sigma_steps[step_idx + 1]
-                t = scheduler.get_sigma_inv(sigma)
-                t_next = scheduler.get_sigma_inv(sigma_next)
-                dt = t_next - t
-                st = scheduler.get_scaling(t)
-                dst = scheduler.get_scaling_derivative(t)
-                dsigma = scheduler.get_sigma_derivative(t)
-
-                model.requires_grad_(True)
-                x0_hat = model.tweedie(xt_grad / st, sigma)
-
-                # Euler step (keep in graph for DRaFT backprop)
-                score = (x0_hat - xt_grad / st) / sigma ** 2
-                deriv = dst / st * xt_grad - st * dsigma * sigma * score
-                xt_grad = xt_grad + dt * deriv
-                model.requires_grad_(False)
-
-            # Final Tweedie at the last reached noise level
-            final_step_idx = min(prefix_steps + K, total_dps_steps)
-            sigma_final = sigma_steps[final_step_idx] if final_step_idx < len(sigma_steps) else sigma_steps[-1]
-            t_final = scheduler.get_sigma_inv(sigma_final)
-            st_final = scheduler.get_scaling(t_final)
-
-            model.requires_grad_(True)
-            x0_hat = model.tweedie(xt_grad / st_final, sigma_final)
-            model.requires_grad_(False)
-
-        # --- reward loss: measurement consistency ---
-        reward_loss = operator.loss(x0_hat, measurement).mean()
-
-        # --- KL regularisation (optional) ---
-        kl_loss = torch.tensor(0.0, device=device)
-        if lambda_kl > 0:
-            with torch.no_grad():
-                x0_frozen = frozen_tweedie(model, lora_modules, xt / st_boundary, sigma_boundary)
-            kl_loss = ((x0_hat - x0_frozen) ** 2).mean()
-
-        total_loss = reward_loss + lambda_kl * kl_loss
-        total_loss.backward()
-
-        torch.nn.utils.clip_grad_norm_(lora_params, grad_clip)
-        optimizer.step()
-
-        loss_val = total_loss.item()
-        losses.append(loss_val)
-        if verbose:
-            pbar.set_postfix(loss=f"{loss_val:.4f}", reward=f"{reward_loss.item():.4f}")
-
-    # --- final evaluation with finetuned model ---
-    with torch.no_grad():
-        x_start_eval = sampler.get_start(measurement.shape[0], model)
-        sample_after = dps_final_sample(model, sampler, x_start_eval, operator, measurement)
-        metrics_after = evaluator(gt, measurement, sample_after)
-
-    # --- cleanup ---
-    remove_lora(model)
-
-    return {
-        "sample_before": sample_before,
-        "sample_after": sample_after,
-        "metrics_before": metrics_before,
-        "metrics_after": metrics_after,
-        "losses": losses,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Hydra entry point
+# Training loop
 # ---------------------------------------------------------------------------
 
 @hydra.main(version_base="1.3", config_path="configs", config_name="default.yaml")
 def main(args: DictConfig):
-    # --- reproducibility ---
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
@@ -268,91 +98,167 @@ def main(args: DictConfig):
 
     print(yaml.dump(OmegaConf.to_container(args, resolve=True), indent=4))
 
-    # --- TTT hyperparameters (with defaults) ---
-    ttt_cfg = OmegaConf.to_container(args.get("ttt", {}), resolve=True)
-    lora_rank = ttt_cfg.get("lora_rank", 4)
-    lora_alpha = ttt_cfg.get("lora_alpha", 1.0)
-    lr = ttt_cfg.get("lr", 1e-4)
-    num_ttt_steps = ttt_cfg.get("num_ttt_steps", 50)
-    lambda_kl = ttt_cfg.get("lambda_kl", 0.01)
-    grad_clip = ttt_cfg.get("grad_clip", 1.0)
-    K = ttt_cfg.get("K", 1)
+    # --- config ---
+    cfg = OmegaConf.to_container(args.get("ttt", {}), resolve=True)
+    lora_rank = cfg.get("lora_rank", 64)
+    lora_alpha = cfg.get("lora_alpha", 1.0)
+    y_channels = cfg.get("y_channels", 3)  # 0 = unconditioned LoRA
+    target_modules = cfg.get("target_modules", "all")
+    lr = cfg.get("lr", 1e-4)
+    num_epochs = cfg.get("num_epochs", 5)
+    lambda_kl = cfg.get("lambda_kl", 0.01)
+    grad_clip = cfg.get("grad_clip", 1.0)
+    grad_accum = cfg.get("grad_accum", 1)  # accumulate over N images before stepping
+    K = cfg.get("K", 1)
 
     # --- data ---
     dataset = get_dataset(**args.data)
-    total_number = len(dataset)
-    images = dataset.get_data(total_number, 0)
+    num_images = len(dataset)
+    images = dataset.get_data(num_images, 0)
 
     # --- operator & measurement ---
     task_group = args.task[args.task_group]
     operator = get_operator(**task_group.operator)
     y = operator.measure(images)
 
-    # --- sampler (must be DPS) ---
-    sampler = get_sampler(**args.sampler, mcmc_sampler_config=task_group.get("mcmc_sampler_config", None))
+    # --- sampler ---
+    sampler = get_sampler(**args.sampler,
+                          mcmc_sampler_config=task_group.get("mcmc_sampler_config", None))
 
     # --- model ---
     model = get_model(**args.model)
 
-    # --- evaluator ---
-    eval_fn_list = [get_eval_fn(name) for name in args.eval_fn_list]
-    evaluator = Evaluator(eval_fn_list)
-
-    # --- output directory ---
-    save_dir = Path(args.save_dir)
-    save_dir.mkdir(parents=True, exist_ok=True)
-    root = save_dir / args.name
-    root.mkdir(exist_ok=True)
+    # --- output ---
+    root = Path(args.save_dir) / args.name
+    root.mkdir(parents=True, exist_ok=True)
     with open(str(root / "config.yaml"), "w") as f:
         yaml.safe_dump(OmegaConf.to_container(args, resolve=True), f)
 
-    # --- per-image TTT loop ---
-    all_before, all_after = [], []
-    for img_idx in range(total_number):
-        print(f"\n=== Image {img_idx + 1}/{total_number} ===")
-        gt_i = images[img_idx: img_idx + 1]
-        y_i = y[img_idx: img_idx + 1]
+    # --- setup LoRA (once, across entire dataset) ---
+    scheduler = sampler.scheduler
+    guidance_scale = sampler.guidance_scale
+    sigma_steps = scheduler.sigma_steps
+    total_dps_steps = len(sigma_steps) - 1
+    prefix_steps = max(total_dps_steps - K, 0)
 
-        result = run_ttt(
-            model, sampler, operator, y_i, gt_i, evaluator,
-            lora_rank=lora_rank, lora_alpha=lora_alpha, lr=lr,
-            num_ttt_steps=num_ttt_steps, lambda_kl=lambda_kl,
-            grad_clip=grad_clip, K=K, verbose=True,
-        )
+    if y_channels > 0:
+        lora_modules, store = apply_conditioned_lora(
+            model, rank=lora_rank, alpha=lora_alpha, y_channels=y_channels,
+            target_modules=target_modules)
+    else:
+        lora_modules = apply_lora(model, rank=lora_rank, alpha=lora_alpha)
+        store = None
+    lora_params = get_lora_params(lora_modules)
+    optimizer = torch.optim.AdamW(lora_params, lr=lr, weight_decay=0.0)
 
-        # log per-image metrics
-        for name in result["metrics_before"]:
-            before_val = result["metrics_before"][name].item()
-            after_val = result["metrics_after"][name].item()
-            print(f"  {name}: {before_val:.4f} -> {after_val:.4f}")
+    print(f"Training LoRA ({sum(p.numel() for p in lora_params)} params) "
+          f"across {num_images} images for {num_epochs} epochs, "
+          f"grad_accum={grad_accum}")
 
-        all_before.append(result["sample_before"])
-        all_after.append(result["sample_after"])
+    # --- training ---
+    step_losses = []  # per optimizer-step loss (averaged over accum window)
+    epoch_avg_losses = []
 
-        # save samples
-        img_dir = root / "samples"
-        img_dir.mkdir(exist_ok=True)
-        save_image(
-            result["sample_after"] * 0.5 + 0.5,
-            str(img_dir / f"{img_idx:05d}_ttt.png"),
-        )
-        save_image(
-            result["sample_before"] * 0.5 + 0.5,
-            str(img_dir / f"{img_idx:05d}_baseline.png"),
-        )
+    for epoch in range(num_epochs):
+        epoch_loss = 0.0
+        order = np.random.permutation(num_images)
+        pbar = tqdm.tqdm(order, desc=f"Epoch {epoch+1}/{num_epochs}")
 
-    # --- aggregate metrics ---
-    all_before = torch.cat(all_before, dim=0)
-    all_after = torch.cat(all_after, dim=0)
-    print("\n=== Aggregate Results ===")
-    with torch.no_grad():
-        results_before = evaluator(images, y, all_before)
-        results_after = evaluator(images, y, all_after)
-    for name in results_before:
-        print(f"  {name}: baseline={results_before[name].item():.4f}  "
-              f"TTT={results_after[name].item():.4f}")
+        optimizer.zero_grad()
+        accum_loss = 0.0
 
-    print(f"\nFinished TTT for {args.name}!")
+        for i, img_idx in enumerate(pbar):
+            gt_i = images[img_idx: img_idx + 1]
+            y_i = y[img_idx: img_idx + 1]
+
+            # fresh noise
+            x_T = sampler.get_start(1, model)
+
+            # DPS prefix (no grad)
+            if prefix_steps > 0:
+                xt, sigma_b, st_b = dps_sample_prefix(
+                    model, scheduler, guidance_scale, x_T, operator,
+                    y_i, prefix_steps)
+            else:
+                xt = x_T.detach()
+                sigma_b = sigma_steps[0]
+                t_b = scheduler.get_sigma_inv(sigma_b)
+                st_b = scheduler.get_scaling(t_b)
+
+            # gradient-tracked Tweedie (through LoRA)
+            if store is not None:
+                store.set(y_i)
+            model.requires_grad_(True)
+            x0_hat = model.tweedie(xt / st_b, sigma_b)
+
+            # reward loss
+            reward_loss = operator.loss(x0_hat, y_i).mean()
+
+            # KL regularisation
+            kl_loss = torch.tensor(0.0, device=xt.device)
+            if lambda_kl > 0:
+                x0_frozen = frozen_tweedie(model, lora_modules, xt / st_b, sigma_b)
+                kl_loss = ((x0_hat - x0_frozen) ** 2).mean()
+
+            total_loss = (reward_loss + lambda_kl * kl_loss) / grad_accum
+            total_loss.backward()
+            model.requires_grad_(False)
+
+            loss_val = total_loss.item() * grad_accum  # un-scaled for logging
+            accum_loss += loss_val
+            epoch_loss += loss_val
+            pbar.set_postfix(loss=f"{loss_val:.4f}")
+
+            # step every grad_accum images (or at end of epoch)
+            if (i + 1) % grad_accum == 0 or (i + 1) == num_images:
+                torch.nn.utils.clip_grad_norm_(lora_params, grad_clip)
+                optimizer.step()
+                optimizer.zero_grad()
+                n_in_window = ((i % grad_accum) + 1) if (i + 1) == num_images else grad_accum
+                step_losses.append(accum_loss / n_in_window)
+                accum_loss = 0.0
+
+        avg_loss = epoch_loss / num_images
+        epoch_avg_losses.append(avg_loss)
+        print(f"  Epoch {epoch+1} avg loss: {avg_loss:.4f}")
+
+        # save checkpoint each epoch
+        save_lora(lora_modules, str(root / f"lora_epoch{epoch+1}.pt"),
+                  metadata={"epoch": epoch+1, "avg_loss": avg_loss,
+                            "operator": task_group.operator.name})
+
+    # save final
+    save_lora(lora_modules, str(root / "lora_final.pt"),
+              metadata={"epochs": num_epochs,
+                        "operator": task_group.operator.name,
+                        "lora_rank": lora_rank, "lora_alpha": lora_alpha})
+
+    # --- plot loss curve ---
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
+
+    ax1.plot(step_losses, alpha=0.3, label="per step")
+    if len(step_losses) > 10:
+        window = max(len(step_losses) // 20, 5)
+        smoothed = np.convolve(step_losses, np.ones(window)/window, mode='valid')
+        ax1.plot(range(window - 1, window - 1 + len(smoothed)), smoothed,
+                 label=f"smooth (w={window})")
+    ax1.set_xlabel("Optimizer step")
+    ax1.set_ylabel("Loss")
+    ax1.set_title("Per-step loss")
+    ax1.legend()
+
+    ax2.plot(range(1, num_epochs + 1), epoch_avg_losses, "o-")
+    ax2.set_xlabel("Epoch")
+    ax2.set_ylabel("Avg loss")
+    ax2.set_title("Per-epoch avg loss")
+
+    plt.tight_layout()
+    plt.savefig(str(root / "loss_curve.png"), dpi=150)
+    plt.close()
+
+    remove_lora(model)
+    print(f"\nLoRA saved to {root / 'lora_final.pt'}")
+    print(f"Loss curve saved to {root / 'loss_curve.png'}")
 
 
 if __name__ == "__main__":

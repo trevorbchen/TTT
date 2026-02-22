@@ -1,27 +1,27 @@
 """
-Diffusion-DPO finetuning for inverse problems.
+GRPO (Group Relative Policy Optimization) finetuning for inverse problems.
 
 Trains LoRA across a dataset of images sharing the same forward operator A(x)
-so the score model learns to internalize measurement guidance.  Uses the DPO
-loss on the DDPM noise-prediction objective (Salesforce DiffusionDPO).
+so the score model learns to internalize measurement guidance.  Uses
+advantage-weighted DDPM MSE loss over groups of candidate reconstructions.
 
 Pipeline:
-  1. For each training image, generate candidate reconstructions via DPS
-  2. Rank by measurement consistency, form winner/loser pairs
-  3. Train LoRA with DPO loss on DDPM objective (random timestep noising)
+  1. For each training image, generate G candidate reconstructions via DPS
+  2. Compute rewards (measurement consistency), derive group-relative advantages
+  3. Train LoRA with advantage-weighted DDPM loss across the dataset
   4. Save LoRA weights -- at inference, plain diffusion without guidance
 
-Key insight: our model is a DDPM noise predictor wrapped in VPPrecond.
-  F_x = UNet(c_in * x, c_noise)        # noise prediction
-  D_x = x - sigma * F_x                # Tweedie estimate
-We recover noise_pred = (x - D_x) / sigma and use MSE as ELBO proxy.
+The advantage-weighted DDPM loss:
+  L = (1/G) * sum_i  A_i * MSE(noise_pred_i, noise_i)
+where A_i = (R_i - mean(R)) / std(R) is the group-relative advantage.
 
-Reference: https://github.com/SalesforceAIResearch/DiffusionDPO
+References:
+  - DDPO: https://github.com/kvablack/ddpo-pytorch
+  - DeepSeek GRPO: https://arxiv.org/abs/2402.03300
 """
 
 import yaml
 import torch
-import torch.nn.functional as F
 import numpy as np
 import tqdm
 import hydra
@@ -42,103 +42,97 @@ from lora import (apply_lora, apply_conditioned_lora, remove_lora,
 
 def sample_sigma(model, batch_size, device):
     """Sample noise levels from the VP training distribution."""
-    precond = model.model  # VPPrecond
+    precond = model.model
     eps = 1e-5
     t = torch.rand(batch_size, device=device) * (1.0 - eps) + eps
     return precond.sigma(t)
 
 
 # ---------------------------------------------------------------------------
-# Pair generation
+# Candidate generation + advantage computation
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def generate_all_pairs(model, sampler, operator, images, measurements,
-                       num_candidates=4):
-    """Generate winner/loser pairs for every image in the dataset.
+def generate_all_candidates(model, sampler, operator, images, measurements,
+                            num_candidates=6):
+    """Generate candidates + advantages for every image in the dataset.
 
-    For each image, runs DPS num_candidates times, ranks by measurement
-    consistency, and pairs best with worst.
+    For each image, runs DPS num_candidates times, computes rewards
+    (negative measurement loss), and normalizes advantages within each group.
 
     Returns:
-        winners: [N_pairs, C, H, W]
-        losers:  [N_pairs, C, H, W]
-        pair_measurements: [N_pairs, C_y, H_y, W_y] — measurement for each pair
+        candidates: [N_total, C, H, W]  (num_images * num_candidates)
+        advantages: [N_total]
+        cand_measurements: [N_total, C_y, H_y, W_y] — measurement for each candidate
     """
-    all_winners, all_losers, all_y = [], [], []
+    all_candidates, all_advantages, all_y = [], [], []
 
-    for img_idx in tqdm.trange(len(images), desc="Generating pairs"):
+    for img_idx in tqdm.trange(len(images), desc="Generating candidates"):
         y_i = measurements[img_idx: img_idx + 1]
-        candidates, losses = [], []
+        cands, rewards = [], []
 
         for _ in range(num_candidates):
             x_start = sampler.get_start(1, model)
             with torch.enable_grad():
                 x_hat = sampler.sample(model, x_start, operator, y_i, verbose=False)
             loss = operator.loss(x_hat, y_i)
-            candidates.append(x_hat)
-            losses.append(loss)
+            cands.append(x_hat)
+            rewards.append(-loss)  # higher = better
 
-        candidates = torch.cat(candidates, dim=0)  # [G, C, H, W]
-        losses = torch.cat(losses, dim=0)           # [G]
+        cands = torch.cat(cands, dim=0)    # [G, C, H, W]
+        rewards = torch.cat(rewards, dim=0)  # [G]
 
-        # pair best with worst
-        order = losses.argsort()
-        n_pairs = len(order) // 2
-        w_idx = order[:n_pairs]
-        l_idx = order[-n_pairs:].flip(0)
-        all_winners.append(candidates[w_idx])
-        all_losers.append(candidates[l_idx])
-        all_y.append(y_i.expand(n_pairs, -1, -1, -1))
+        # group-relative advantages
+        std = rewards.std()
+        if std < 1e-8:
+            advs = torch.zeros_like(rewards)
+        else:
+            advs = (rewards - rewards.mean()) / std
 
-    return torch.cat(all_winners), torch.cat(all_losers), torch.cat(all_y)
+        all_candidates.append(cands)
+        all_advantages.append(advs)
+        all_y.append(y_i.expand(num_candidates, -1, -1, -1))
+
+    return torch.cat(all_candidates), torch.cat(all_advantages), torch.cat(all_y)
 
 
 # ---------------------------------------------------------------------------
-# DPO loss
+# GRPO loss
 # ---------------------------------------------------------------------------
 
-def dpo_loss_batch(model, lora_modules, winners, losers, beta_dpo=5000.0,
-                   store=None, y_batch=None):
-    """DPO loss on a batch of winner/loser pairs at a random DDPM timestep."""
-    device = winners.device
-    B = winners.shape[0]
+def grpo_loss_batch(model, lora_modules, candidates, advantages,
+                    lambda_kl=0.0, store=None, y_batch=None):
+    """Advantage-weighted DDPM MSE loss on a batch."""
+    device = candidates.device
+    B = candidates.shape[0]
 
     sigma = sample_sigma(model, B, device)
-    sigma_bc = sigma.view(-1, *([1] * (winners.ndim - 1)))
-    noise = torch.randn_like(winners)
+    sigma_bc = sigma.view(-1, *([1] * (candidates.ndim - 1)))
+    noise = torch.randn_like(candidates)
 
-    x_w_noisy = winners + sigma_bc * noise
-    x_l_noisy = losers + sigma_bc * noise
+    x_noisy = candidates + sigma_bc * noise
 
     # model predictions (LoRA active — store sees measurement)
     if store is not None and y_batch is not None:
         store.set(y_batch)
     model.requires_grad_(True)
-    D_w = model.tweedie(x_w_noisy, sigma)
-    D_l = model.tweedie(x_l_noisy, sigma)
+    D_x = model.tweedie(x_noisy, sigma)
 
-    eps_w = (x_w_noisy - D_w) / sigma_bc
-    eps_l = (x_l_noisy - D_l) / sigma_bc
-    model_mse_w = (eps_w - noise).pow(2).mean(dim=[1, 2, 3])
-    model_mse_l = (eps_l - noise).pow(2).mean(dim=[1, 2, 3])
+    noise_pred = (x_noisy - D_x) / sigma_bc
+    mse_per_sample = (noise_pred - noise).pow(2).mean(dim=[1, 2, 3])
 
-    # reference predictions (LoRA zeroed)
-    D_w_ref = frozen_tweedie(model, lora_modules, x_w_noisy, sigma)
-    D_l_ref = frozen_tweedie(model, lora_modules, x_l_noisy, sigma)
-    eps_w_ref = (x_w_noisy - D_w_ref) / sigma_bc
-    eps_l_ref = (x_l_noisy - D_l_ref) / sigma_bc
-    ref_mse_w = (eps_w_ref - noise).pow(2).mean(dim=[1, 2, 3])
-    ref_mse_l = (eps_l_ref - noise).pow(2).mean(dim=[1, 2, 3])
+    # advantage-weighted loss
+    policy_loss = (advantages * mse_per_sample).mean()
 
-    model_diff = model_mse_w - model_mse_l
-    ref_diff = ref_mse_w - ref_mse_l
-    inside_term = -0.5 * beta_dpo * (model_diff - ref_diff)
+    # optional KL regularization
+    kl_loss = torch.tensor(0.0, device=device)
+    if lambda_kl > 0:
+        D_x_ref = frozen_tweedie(model, lora_modules, x_noisy, sigma)
+        noise_pred_ref = (x_noisy - D_x_ref) / sigma_bc
+        kl_loss = (noise_pred - noise_pred_ref.detach()).pow(2).mean()
 
-    loss = -F.logsigmoid(inside_term).mean()
-    with torch.no_grad():
-        acc = (inside_term > 0).float().mean()
-    return loss, acc
+    loss = policy_loss + lambda_kl * kl_loss
+    return loss
 
 
 # ---------------------------------------------------------------------------
@@ -156,17 +150,17 @@ def main(args: DictConfig):
     print(yaml.dump(OmegaConf.to_container(args, resolve=True), indent=4))
 
     # --- config ---
-    cfg = OmegaConf.to_container(args.get("dpo", {}), resolve=True)
+    cfg = OmegaConf.to_container(args.get("grpo", {}), resolve=True)
     lora_rank = cfg.get("lora_rank", 64)
     lora_alpha = cfg.get("lora_alpha", 1.0)
     y_channels = cfg.get("y_channels", 3)  # 0 = unconditioned LoRA
     target_modules = cfg.get("target_modules", "all")
     lr = cfg.get("lr", 1e-4)
     num_epochs = cfg.get("num_epochs", 10)
-    num_candidates = cfg.get("num_candidates", 4)
-    beta_dpo = cfg.get("beta_dpo", 5000.0)
+    num_candidates = cfg.get("num_candidates", 6)
+    lambda_kl = cfg.get("lambda_kl", 0.0)
     grad_clip = cfg.get("grad_clip", 1.0)
-    batch_size = cfg.get("train_batch_size", 4)
+    batch_size = cfg.get("train_batch_size", 8)
 
     # --- data ---
     dataset = get_dataset(**args.data)
@@ -189,12 +183,13 @@ def main(args: DictConfig):
     with open(str(root / "config.yaml"), "w") as f:
         yaml.safe_dump(OmegaConf.to_container(args, resolve=True), f)
 
-    # --- generate pairs (one-time, before LoRA) ---
+    # --- generate candidates + advantages (one-time, before LoRA) ---
     print(f"Generating {num_candidates} candidates per image ({num_images} images)...")
-    winners, losers, pair_y = generate_all_pairs(
+    candidates, advantages, cand_y = generate_all_candidates(
         model, sampler, operator, images, y, num_candidates=num_candidates)
-    num_pairs = len(winners)
-    print(f"Total pairs: {num_pairs}")
+    num_samples = len(candidates)
+    print(f"Total samples: {num_samples}, "
+          f"positive advantage: {(advantages > 0).sum()}/{num_samples}")
 
     # --- setup LoRA ---
     if y_channels > 0:
@@ -212,34 +207,32 @@ def main(args: DictConfig):
 
     # --- training ---
     for epoch in range(num_epochs):
-        order = np.random.permutation(num_pairs)
-        epoch_loss, epoch_acc, num_batches = 0.0, 0.0, 0
+        order = np.random.permutation(num_samples)
+        epoch_loss, num_batches = 0.0, 0
 
-        pbar = tqdm.tqdm(range(0, num_pairs, batch_size),
+        pbar = tqdm.tqdm(range(0, num_samples, batch_size),
                          desc=f"Epoch {epoch+1}/{num_epochs}")
         for start in pbar:
             idx = order[start: start + batch_size]
-            w_batch = winners[idx]
-            l_batch = losers[idx]
-            y_batch = pair_y[idx]
+            c_batch = candidates[idx]
+            a_batch = advantages[idx]
+            y_batch = cand_y[idx]
 
             optimizer.zero_grad()
-            loss, acc = dpo_loss_batch(model, lora_modules, w_batch, l_batch,
-                                       beta_dpo=beta_dpo,
-                                       store=store, y_batch=y_batch)
+            loss = grpo_loss_batch(model, lora_modules, c_batch, a_batch,
+                                   lambda_kl=lambda_kl,
+                                   store=store, y_batch=y_batch)
             loss.backward()
             model.requires_grad_(False)
             torch.nn.utils.clip_grad_norm_(lora_params, grad_clip)
             optimizer.step()
 
             epoch_loss += loss.item()
-            epoch_acc += acc.item()
             num_batches += 1
-            pbar.set_postfix(loss=f"{loss.item():.4f}", acc=f"{acc.item():.2f}")
+            pbar.set_postfix(loss=f"{loss.item():.4f}")
 
         avg_loss = epoch_loss / max(num_batches, 1)
-        avg_acc = epoch_acc / max(num_batches, 1)
-        print(f"  Epoch {epoch+1} avg loss: {avg_loss:.4f}, avg acc: {avg_acc:.2f}")
+        print(f"  Epoch {epoch+1} avg loss: {avg_loss:.4f}")
 
         save_lora(lora_modules, str(root / f"lora_epoch{epoch+1}.pt"),
                   metadata={"epoch": epoch+1, "avg_loss": avg_loss})
