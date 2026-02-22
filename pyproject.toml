@@ -54,6 +54,9 @@ deblur = [
     "ninja>=1.10.0",
 ]
 
+[tool.setuptools]
+py-modules = []
+
 [tool.uv]
 # torch with CUDA is best installed from the PyTorch index.
 # Use this to install with CUDA 12.4 support:
