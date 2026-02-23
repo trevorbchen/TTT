@@ -79,7 +79,7 @@ class MeasurementEncoder(nn.Module):
         """
         B = y.shape[0]
         if y.is_complex():
-            y = torch.view_as_real(y).flatten(1)  # [B, 2*numel]
+            y = torch.view_as_real(y).flatten(1).float()  # [B, 2*numel]
         else:
             y = y.flatten(1).float()
 
