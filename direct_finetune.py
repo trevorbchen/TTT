@@ -1,5 +1,5 @@
 """
-DRaFT-style direct finetuning for DPS.
+DRaFT-style direct finetuning for DPS/DAPS.
 
 Trains LoRA across a dataset of images sharing the same forward operator A(x)
 so the score model learns to internalize measurement guidance:
@@ -9,9 +9,9 @@ After training, the LoRA-adapted model can reconstruct from measurements
 WITHOUT running DPS guidance gradients at each step -- plain diffusion
 sampling suffices.
 
-Approach: For each training image, run DPS prefix steps (no grad) to get
-near-clean x_t, then backprop the reward signal R = -||y - A(tweedie(x_t))||^2
-through the final Tweedie step into the LoRA weights (ReFL, K=1).
+Supports two sampler backends:
+  - DPS: run prefix steps (no grad), then backprop through final Tweedie step
+  - DAPS: run full DAPS sampling (no grad), then backprop reward on final output
 """
 
 import yaml
@@ -26,7 +26,7 @@ from omegaconf import OmegaConf, DictConfig
 from forward_operator import get_operator
 from data import get_dataset
 from model import get_model
-from sampler import get_sampler
+from sampler import get_sampler, DPS
 from cores.scheduler import get_diffusion_scheduler
 from lora import (apply_lora, apply_conditioned_lora, remove_lora,
                   get_lora_params, frozen_tweedie, save_lora)
@@ -134,12 +134,20 @@ def main(args: DictConfig):
     with open(str(root / "config.yaml"), "w") as f:
         yaml.safe_dump(OmegaConf.to_container(args, resolve=True), f)
 
-    # --- setup LoRA (once, across entire dataset) ---
-    scheduler = sampler.scheduler
-    guidance_scale = sampler.guidance_scale
-    sigma_steps = scheduler.sigma_steps
-    total_dps_steps = len(sigma_steps) - 1
-    prefix_steps = max(total_dps_steps - K, 0)
+    # --- detect sampler type ---
+    use_dps = isinstance(sampler, DPS)
+
+    if use_dps:
+        scheduler = sampler.scheduler
+        guidance_scale = sampler.guidance_scale
+        sigma_steps = scheduler.sigma_steps
+        total_dps_steps = len(sigma_steps) - 1
+        prefix_steps = max(total_dps_steps - K, 0)
+    else:
+        # DAPS: use the annealing scheduler's final sigma for Tweedie step
+        scheduler = sampler.annealing_scheduler
+        sigma_steps = scheduler.sigma_steps
+        print("Using DAPS backend: full sampling + reward backprop on final output")
 
     if y_channels > 0:
         lora_modules, store = apply_conditioned_lora(
@@ -174,22 +182,37 @@ def main(args: DictConfig):
             # fresh noise
             x_T = sampler.get_start(1, model)
 
-            # DPS prefix (no grad)
-            if prefix_steps > 0:
-                xt, sigma_b, st_b = dps_sample_prefix(
-                    model, scheduler, guidance_scale, x_T, operator,
-                    y_i, prefix_steps)
-            else:
-                xt = x_T.detach()
-                sigma_b = sigma_steps[0]
-                t_b = scheduler.get_sigma_inv(sigma_b)
-                st_b = scheduler.get_scaling(t_b)
+            if use_dps:
+                # DPS prefix (no grad)
+                if prefix_steps > 0:
+                    xt, sigma_b, st_b = dps_sample_prefix(
+                        model, scheduler, guidance_scale, x_T, operator,
+                        y_i, prefix_steps)
+                else:
+                    xt = x_T.detach()
+                    sigma_b = sigma_steps[0]
+                    t_b = scheduler.get_sigma_inv(sigma_b)
+                    st_b = scheduler.get_scaling(t_b)
 
-            # gradient-tracked Tweedie (through LoRA)
-            if store is not None:
-                store.set(y_i)
-            model.requires_grad_(True)
-            x0_hat = model.tweedie(xt / st_b, sigma_b)
+                # gradient-tracked Tweedie (through LoRA)
+                if store is not None:
+                    store.set(y_i)
+                model.requires_grad_(True)
+                x0_hat = model.tweedie(xt / st_b, sigma_b)
+            else:
+                # DAPS: full sampling (no grad), then gradient-tracked Tweedie
+                with torch.no_grad():
+                    x0_daps = sampler.sample(model, x_T, operator, y_i, verbose=False)
+                # Re-noise lightly and do one gradient-tracked Tweedie step
+                sigma_min = sigma_steps[-1]
+                t_min = scheduler.get_sigma_inv(sigma_min)
+                st_min = scheduler.get_scaling(t_min)
+                xt = x0_daps + sigma_min * torch.randn_like(x0_daps)
+
+                if store is not None:
+                    store.set(y_i)
+                model.requires_grad_(True)
+                x0_hat = model.tweedie(xt / st_min, sigma_min)
 
             # reward loss
             reward_loss = operator.loss(x0_hat, y_i).mean()

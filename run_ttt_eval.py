@@ -122,6 +122,7 @@ def main(args: DictConfig):
     lora_path = eval_cfg.get("lora_path", None)
     if lora_path is None:
         raise ValueError("Must provide +eval.lora_path=<path_to_lora.pt>")
+    skip_baseline = eval_cfg.get("skip_baseline", False)
 
     # --- data ---
     dataset = get_dataset(**args.data)
@@ -158,20 +159,26 @@ def main(args: DictConfig):
     # ===================================================================
     # Phase 1: DPS baseline (guided, no LoRA)
     # ===================================================================
-    print(f"\n{'='*60}")
-    print(f"Phase 1: DPS baseline ({total_number} images)")
-    print(f"{'='*60}")
+    if skip_baseline:
+        print(f"\n{'='*60}")
+        print(f"Phase 1: SKIPPED (skip_baseline=True)")
+        print(f"{'='*60}")
+        all_baseline = None
+    else:
+        print(f"\n{'='*60}")
+        print(f"Phase 1: DPS baseline ({total_number} images)")
+        print(f"{'='*60}")
 
-    all_baseline = []
-    for img_idx in tqdm.trange(total_number, desc="DPS baseline"):
-        gt_i = images[img_idx: img_idx + 1]
-        y_i = y[img_idx: img_idx + 1]
+        all_baseline = []
+        for img_idx in tqdm.trange(total_number, desc="DPS baseline"):
+            gt_i = images[img_idx: img_idx + 1]
+            y_i = y[img_idx: img_idx + 1]
 
-        x_start = sampler.get_start(1, model)
-        x_hat = sampler.sample(model, x_start, operator, y_i, verbose=False)
-        all_baseline.append(x_hat)
+            x_start = sampler.get_start(1, model)
+            x_hat = sampler.sample(model, x_start, operator, y_i, verbose=False)
+            all_baseline.append(x_hat)
 
-    all_baseline = torch.cat(all_baseline, dim=0)
+        all_baseline = torch.cat(all_baseline, dim=0)
 
     # ===================================================================
     # Phase 2: LoRA model plain diffusion (unguided)
@@ -222,81 +229,99 @@ def main(args: DictConfig):
     for img_idx in range(total_number):
         gt_i = images[img_idx: img_idx + 1]
         y_i = y[img_idx: img_idx + 1]
-        baseline_i = all_baseline[img_idx: img_idx + 1]
         lora_i = all_lora[img_idx: img_idx + 1]
 
         with torch.no_grad():
-            metrics_baseline = evaluator(gt_i, y_i, baseline_i)
             metrics_lora = evaluator(gt_i, y_i, lora_i)
-
-            # measurement consistency: ||A(x̂) - y||²
-            mc_baseline = operator.loss(baseline_i, y_i)
             mc_lora = operator.loss(lora_i, y_i)
-            metrics_baseline["meas_l2"] = mc_baseline.mean()
             metrics_lora["meas_l2"] = mc_lora.mean()
+
+            if all_baseline is not None:
+                baseline_i = all_baseline[img_idx: img_idx + 1]
+                metrics_baseline = evaluator(gt_i, y_i, baseline_i)
+                mc_baseline = operator.loss(baseline_i, y_i)
+                metrics_baseline["meas_l2"] = mc_baseline.mean()
 
         img_metrics = {"image_idx": img_idx}
         if metric_names is None:
-            metric_names = list(metrics_baseline.keys())
+            metric_names = list(metrics_lora.keys())
 
         for name in metric_names:
-            b = metrics_baseline[name].item()
             a = metrics_lora[name].item()
-            img_metrics[f"{name}_baseline"] = b
             img_metrics[f"{name}_lora"] = a
-            img_metrics[f"{name}_delta"] = a - b
+            if all_baseline is not None:
+                b = metrics_baseline[name].item()
+                img_metrics[f"{name}_baseline"] = b
+                img_metrics[f"{name}_delta"] = a - b
         all_metrics.append(img_metrics)
 
         # save individual samples
-        save_image(norm(baseline_i),
-                   str(root / "samples" / f"{img_idx:05d}_baseline.png"))
         save_image(norm(lora_i),
                    str(root / "samples" / f"{img_idx:05d}_lora.png"))
+        if all_baseline is not None:
+            save_image(norm(baseline_i),
+                       str(root / "samples" / f"{img_idx:05d}_baseline.png"))
 
-        # comparison grid: GT | measurement | DPS baseline | LoRA
+        # comparison grid
         y_resized = resize_y(y_i, gt_i.shape)
-        grid = torch.cat([
-            norm(gt_i),
-            norm(y_resized),
-            norm(baseline_i),
-            norm(lora_i),
-        ], dim=0)
-        save_image(grid,
-                   str(root / "comparisons" / f"{img_idx:05d}.png"),
-                   nrow=4, padding=2)
+        if all_baseline is not None:
+            grid = torch.cat([
+                norm(gt_i), norm(y_resized), norm(baseline_i), norm(lora_i),
+            ], dim=0)
+            save_image(grid, str(root / "comparisons" / f"{img_idx:05d}.png"),
+                       nrow=4, padding=2)
+        else:
+            grid = torch.cat([
+                norm(gt_i), norm(y_resized), norm(lora_i),
+            ], dim=0)
+            save_image(grid, str(root / "comparisons" / f"{img_idx:05d}.png"),
+                       nrow=3, padding=2)
 
     # --- aggregate statistics ---
-    baseline_vals = {n: np.array([m[f"{n}_baseline"] for m in all_metrics]) for n in metric_names}
     lora_vals = {n: np.array([m[f"{n}_lora"] for m in all_metrics]) for n in metric_names}
-    delta_vals = {n: lora_vals[n] - baseline_vals[n] for n in metric_names}
 
-    print(f"\n{'='*60}")
-    print(f"Results: LoRA vs DPS baseline | {total_number} images")
-    print(f"{'='*60}")
-    print(f"{'metric':<8} {'DPS baseline':>18} {'LoRA (no guide)':>18} {'delta':>18}")
-    print(f"{'':<8} {'mean +/- std':>18} {'mean +/- std':>18} {'mean +/- std':>18}")
-    print(f"{'-'*62}")
-    for n in metric_names:
-        bm, bs = baseline_vals[n].mean(), baseline_vals[n].std()
-        am, astd = lora_vals[n].mean(), lora_vals[n].std()
-        dm, ds = delta_vals[n].mean(), delta_vals[n].std()
-        print(f"{n:<8} {bm:>7.4f} +/- {bs:<6.4f} {am:>7.4f} +/- {astd:<6.4f} {dm:>+7.4f} +/- {ds:<6.4f}")
-    print(f"{'-'*62}")
+    if all_baseline is not None:
+        baseline_vals = {n: np.array([m[f"{n}_baseline"] for m in all_metrics]) for n in metric_names}
+        delta_vals = {n: lora_vals[n] - baseline_vals[n] for n in metric_names}
 
-    # how many images improved?
-    for n in metric_names:
-        # PSNR/SSIM: higher is better; LPIPS/meas_l2: lower is better
-        improved = (delta_vals[n] > 0).sum() if n in ("psnr", "ssim") else (delta_vals[n] < 0).sum()
-        print(f"  {n}: {improved}/{total_number} images improved")
+        print(f"\n{'='*60}")
+        print(f"Results: LoRA vs DPS baseline | {total_number} images")
+        print(f"{'='*60}")
+        print(f"{'metric':<8} {'DPS baseline':>18} {'LoRA (no guide)':>18} {'delta':>18}")
+        print(f"{'':<8} {'mean +/- std':>18} {'mean +/- std':>18} {'mean +/- std':>18}")
+        print(f"{'-'*62}")
+        for n in metric_names:
+            bm, bs = baseline_vals[n].mean(), baseline_vals[n].std()
+            am, astd = lora_vals[n].mean(), lora_vals[n].std()
+            dm, ds = delta_vals[n].mean(), delta_vals[n].std()
+            print(f"{n:<8} {bm:>7.4f} +/- {bs:<6.4f} {am:>7.4f} +/- {astd:<6.4f} {dm:>+7.4f} +/- {ds:<6.4f}")
+        print(f"{'-'*62}")
+
+        for n in metric_names:
+            improved = (delta_vals[n] > 0).sum() if n in ("psnr", "ssim") else (delta_vals[n] < 0).sum()
+            print(f"  {n}: {improved}/{total_number} images improved")
+    else:
+        print(f"\n{'='*60}")
+        print(f"Results: LoRA only (baseline skipped) | {total_number} images")
+        print(f"{'='*60}")
+        print(f"{'metric':<8} {'LoRA (no guide)':>18}")
+        print(f"{'':<8} {'mean +/- std':>18}")
+        print(f"{'-'*30}")
+        for n in metric_names:
+            am, astd = lora_vals[n].mean(), lora_vals[n].std()
+            print(f"{n:<8} {am:>7.4f} +/- {astd:<6.4f}")
+        print(f"{'-'*30}")
 
     # --- save full comparison grid ---
     y_resized = resize_y(y, images.shape)
-    full_grid = torch.cat([
-        norm(images),
-        norm(y_resized),
-        norm(all_baseline),
-        norm(all_lora),
-    ], dim=0)
+    if all_baseline is not None:
+        full_grid = torch.cat([
+            norm(images), norm(y_resized), norm(all_baseline), norm(all_lora),
+        ], dim=0)
+    else:
+        full_grid = torch.cat([
+            norm(images), norm(y_resized), norm(all_lora),
+        ], dim=0)
     save_image(full_grid,
                str(root / "full_comparison.png"),
                nrow=total_number, padding=2)
@@ -304,20 +329,25 @@ def main(args: DictConfig):
     # --- save metrics to JSON ---
     aggregate = {}
     for n in metric_names:
-        aggregate[n] = {
-            "baseline_mean": float(baseline_vals[n].mean()),
-            "baseline_std": float(baseline_vals[n].std()),
+        agg = {
             "lora_mean": float(lora_vals[n].mean()),
             "lora_std": float(lora_vals[n].std()),
-            "delta_mean": float(delta_vals[n].mean()),
-            "delta_std": float(delta_vals[n].std()),
-            "delta_min": float(delta_vals[n].min()),
-            "delta_max": float(delta_vals[n].max()),
         }
+        if all_baseline is not None:
+            agg.update({
+                "baseline_mean": float(baseline_vals[n].mean()),
+                "baseline_std": float(baseline_vals[n].std()),
+                "delta_mean": float(delta_vals[n].mean()),
+                "delta_std": float(delta_vals[n].std()),
+                "delta_min": float(delta_vals[n].min()),
+                "delta_max": float(delta_vals[n].max()),
+            })
+        aggregate[n] = agg
 
     output = {
         "lora_path": str(lora_path),
         "num_images": total_number,
+        "skip_baseline": skip_baseline,
         "aggregate": aggregate,
         "per_image": all_metrics,
     }
