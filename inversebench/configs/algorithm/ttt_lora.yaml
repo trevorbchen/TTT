@@ -1,0 +1,10 @@
+name: TTT-LoRA
+method:
+  _target_: algo.ttt_lora.TTTLoRA
+  lora_path: exps/ttt/lora_final.pt
+  diffusion_scheduler_config:
+    num_steps: 200
+    schedule: vp
+    timestep: vp
+    scaling: vp
+  sde: False

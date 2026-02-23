@@ -1,0 +1,45 @@
+method: direct        # direct | dpo | grpo
+train_pct: 80         # % of training set to use (rest held out for eval)
+
+# LoRA
+lora_rank: 64
+lora_alpha: 1.0
+y_channels: 0         # 0 = unconditioned (safe for all problems)
+target_modules: all   # attention | resblock | all
+
+# Shared training
+lr: 1e-3
+grad_clip: 1.0
+num_epochs: 10
+save_dir: exps/ttt
+
+# Direct-specific
+K: 1
+lambda_kl: 0.01
+grad_accum: 1
+guidance_scale: 1.0
+
+# DPO-specific
+beta_dpo: 5000.0
+dpo_batch_size: 4
+
+# GRPO-specific
+num_candidates: 6
+adv_clip: 5.0
+grpo_lambda_kl: 0.0
+grpo_batch_size: 8
+
+# Stability & scheduling
+warmup_steps: 50          # linear LR warmup steps
+weight_decay: 1e-4        # AdamW weight decay on LoRA params
+ema_decay: 0.995          # EMA decay for LoRA weights (0 = disabled)
+loss_spike_threshold: 5.0 # rollback if loss > threshold x rolling avg
+patience: 3               # early stop if no improvement for N epochs
+min_lr_ratio: 0.1         # cosine decay floor (fraction of base lr)
+
+# Scheduler (for DPS prefix + plain diffusion)
+diffusion_scheduler_config:
+  num_steps: 200
+  schedule: vp
+  timestep: vp
+  scaling: vp
