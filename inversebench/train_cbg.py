@@ -194,12 +194,13 @@ def save_loss_curves(step_losses, epoch_train, epoch_val, grad_norms, root):
 
 @torch.no_grad()
 def evaluate_held_out(classifier, net, forward_op, eval_images,
-                      eval_measurements, root, logger, batch_size=4):
+                      eval_measurements, root, logger, batch_size=4,
+                      target_mode="tweedie"):
     """Evaluate classifier quality on held-out data."""
     device = eval_images.device
     n_eval = len(eval_images)
     logger.log(f"{'='*60}")
-    logger.log(f"Evaluating on {n_eval} held-out samples...")
+    logger.log(f"Evaluating on {n_eval} held-out samples (target_mode={target_mode})...")
     logger.log(f"{'='*60}")
 
     classifier.eval()
@@ -217,8 +218,11 @@ def evaluate_held_out(classifier, net, forward_op, eval_images,
         eps = torch.randn_like(x0)
         x_noisy = x0 + sigma_bc * eps
 
-        denoised = net(x_noisy, sigma)
-        y_hat = forward_op({'target': denoised})
+        if target_mode == "tweedie":
+            denoised = net(x_noisy, sigma)
+            y_hat = forward_op({'target': denoised})
+        else:  # direct
+            y_hat = forward_op({'target': x_noisy})
         residual = y_hat - y_batch
         if classifier.measurement_decoder is not None:
             if residual.is_complex():
@@ -279,17 +283,20 @@ def main(config: DictConfig):
     val_fraction  = cbg.get("val_fraction", 0.1)
     save_every    = cbg.get("save_every", 10)
     save_dir      = cbg.get("save_dir", "exps/cbg")
+    target_mode   = cbg.get("target_mode", "tweedie")  # "tweedie" or "direct"
+    assert target_mode in ("tweedie", "direct"), \
+        f"Unknown target_mode={target_mode!r}, expected 'tweedie' or 'direct'"
 
     # --- Output directory ---
     problem_name = config.problem.get("name", "unknown")
-    root = Path(save_dir) / f"{problem_name}_cbg_{train_pct}pct_lr{lr}_ch{base_channels}"
+    root = Path(save_dir) / f"{problem_name}_cbg_{target_mode}_{train_pct}pct_lr{lr}_ch{base_channels}"
     root.mkdir(parents=True, exist_ok=True)
 
     # --- Logger ---
     logger = Logger(root)
     logger.log(f"CBG Training for InverseBench")
-    logger.log(f"  base_channels={base_channels}, lr={lr}, "
-               f"epochs={num_epochs}, train_pct={train_pct}")
+    logger.log(f"  target_mode={target_mode}, base_channels={base_channels}, "
+               f"lr={lr}, epochs={num_epochs}, train_pct={train_pct}")
     logger.log(f"  output: {root}")
     logger.log(f"  device: {device}")
     logger.update_progress(status="loading", total_epochs=num_epochs)
@@ -436,8 +443,11 @@ def main(config: DictConfig):
             x_noisy = x0 + sigma_bc * eps
 
             with torch.no_grad():
-                denoised = net(x_noisy, sigma)
-                y_hat = forward_op({'target': denoised})
+                if target_mode == "tweedie":
+                    denoised = net(x_noisy, sigma)
+                    y_hat = forward_op({'target': denoised})
+                else:  # direct
+                    y_hat = forward_op({'target': x_noisy})
                 residual = y_hat - y_batch
                 if classifier.measurement_decoder is not None:
                     # Non-image obs: flatten residual to real for measurement-space loss
@@ -487,8 +497,11 @@ def main(config: DictConfig):
                     eps = torch.randn_like(x0)
                     x_noisy = x0 + sigma_bc * eps
 
-                    denoised = net(x_noisy, sigma)
-                    y_hat = forward_op({'target': denoised})
+                    if target_mode == "tweedie":
+                        denoised = net(x_noisy, sigma)
+                        y_hat = forward_op({'target': denoised})
+                    else:  # direct
+                        y_hat = forward_op({'target': x_noisy})
                     residual = y_hat - y_batch
                     if classifier.measurement_decoder is not None:
                         if residual.is_complex():
@@ -523,7 +536,8 @@ def main(config: DictConfig):
             best_val_loss = avg_val_loss
             save_classifier(classifier, str(root / "classifier_best.pt"),
                             metadata={"epoch": epoch,
-                                      "val_loss": avg_val_loss})
+                                      "val_loss": avg_val_loss,
+                                      "target_mode": target_mode})
             logger.log(f"  -> New best val_loss={avg_val_loss:.6f}")
 
         # Periodic checkpoint
@@ -531,7 +545,8 @@ def main(config: DictConfig):
             save_classifier(classifier, str(root / f"classifier_epoch{epoch}.pt"),
                             metadata={"epoch": epoch,
                                       "train_loss": avg_train_loss,
-                                      "val_loss": avg_val_loss})
+                                      "val_loss": avg_val_loss,
+                                      "target_mode": target_mode})
 
         # Progress + loss curves
         logger.update_progress(
@@ -546,6 +561,7 @@ def main(config: DictConfig):
                     metadata={"epochs": num_epochs,
                               "problem": problem_name,
                               "train_pct": train_pct,
+                              "target_mode": target_mode,
                               "best_val_loss": best_val_loss,
                               "final_train_loss": epoch_train_losses[-1],
                               "final_val_loss": epoch_val_losses[-1]})
@@ -556,7 +572,8 @@ def main(config: DictConfig):
         logger.update_progress(status="evaluating")
         evaluate_held_out(classifier, net, forward_op,
                           eval_images, eval_measurements,
-                          root, logger, batch_size=batch_size)
+                          root, logger, batch_size=batch_size,
+                          target_mode=target_mode)
 
     logger.update_progress(status="done")
     logger.log(f"")
