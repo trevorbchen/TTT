@@ -46,6 +46,32 @@ class LoRAConv1d(nn.Module):
         return self.original_conv(x) + self.scaling * self.lora_up(self.lora_down(x))
 
 
+class LoRAConv2d(nn.Module):
+    """Wraps a frozen Conv2d with a low-rank adapter (1x1 bottleneck)."""
+
+    def __init__(self, original_conv, rank=4, alpha=1.0):
+        super().__init__()
+        self.original_conv = original_conv
+        self.rank = rank
+        self.alpha = alpha
+        self.scaling = alpha / rank
+
+        in_channels = original_conv.in_channels
+        out_channels = original_conv.out_channels
+
+        self.lora_down = nn.Conv2d(in_channels, rank, 1, bias=False)
+        self.lora_up = nn.Conv2d(rank, out_channels, 1, bias=False)
+
+        nn.init.kaiming_uniform_(self.lora_down.weight)
+        nn.init.zeros_(self.lora_up.weight)
+
+        for p in self.original_conv.parameters():
+            p.requires_grad = False
+
+    def forward(self, x):
+        return self.original_conv(x) + self.scaling * self.lora_up(self.lora_down(x))
+
+
 class MeasurementStore:
     """Shared container for the current measurement y.
 
@@ -148,26 +174,49 @@ class LoRAConv2dConditioned(nn.Module):
         return out
 
 
-def apply_lora(model, rank=4, alpha=1.0):
-    """Inject LoRA adapters into all AttentionBlock qkv and proj_out layers.
+def apply_lora(model, rank=4, alpha=1.0, target_modules="attention"):
+    """Inject non-conditioned LoRA adapters into UNet layers.
 
-    Walks ``model.model.model`` (the UNet inside VPPrecond) and replaces
-    Conv1d projections with LoRAConv1d wrappers.
+    Args:
+        model: DDPM diffusion model.
+        rank: LoRA rank (bottleneck dimension).
+        alpha: LoRA scaling numerator (scaling = alpha / rank).
+        target_modules: Which layers to wrap:
+            ``"attention"`` — AttentionBlock qkv + proj_out (Conv1d, 8 modules)
+            ``"resblock"``  — ResBlock in_conv + out_conv (Conv2d, 60 modules)
+            ``"all"``       — both attention and ResBlock layers (68 modules)
 
     Returns:
-        list[LoRAConv1d]: All newly created LoRA modules.
+        list[LoRAConv1d | LoRAConv2d]: All newly created LoRA modules.
     """
     unet = model.model.model  # DDPM -> VPPrecond -> UNet
     lora_modules = []
+    do_attn = target_modules in ("attention", "all")
+    do_res = target_modules in ("resblock", "all")
 
     for module in unet.modules():
-        if isinstance(module, AttentionBlock):
+        if do_attn and isinstance(module, AttentionBlock):
             for attr_name in ("qkv", "proj_out"):
                 orig_conv = getattr(module, attr_name)
                 lora_conv = LoRAConv1d(orig_conv, rank=rank, alpha=alpha)
                 lora_conv = lora_conv.to(next(orig_conv.parameters()).device)
                 setattr(module, attr_name, lora_conv)
                 lora_modules.append(lora_conv)
+
+        if do_res and isinstance(module, ResBlock):
+            orig_in = module.in_layers[-1]
+            if isinstance(orig_in, nn.Conv2d):
+                lora_in = LoRAConv2d(orig_in, rank=rank, alpha=alpha)
+                lora_in = lora_in.to(next(orig_in.parameters()).device)
+                module.in_layers[-1] = lora_in
+                lora_modules.append(lora_in)
+
+            orig_out = module.out_layers[-1]
+            if isinstance(orig_out, nn.Conv2d):
+                lora_out = LoRAConv2d(orig_out, rank=rank, alpha=alpha)
+                lora_out = lora_out.to(next(orig_out.parameters()).device)
+                module.out_layers[-1] = lora_out
+                lora_modules.append(lora_out)
 
     return lora_modules
 
@@ -242,10 +291,10 @@ def remove_lora(model):
 
         if isinstance(module, ResBlock):
             wrapper_in = module.in_layers[-1]
-            if isinstance(wrapper_in, LoRAConv2dConditioned):
+            if isinstance(wrapper_in, (LoRAConv2d, LoRAConv2dConditioned)):
                 module.in_layers[-1] = wrapper_in.original_conv
             wrapper_out = module.out_layers[-1]
-            if isinstance(wrapper_out, LoRAConv2dConditioned):
+            if isinstance(wrapper_out, (LoRAConv2d, LoRAConv2dConditioned)):
                 module.out_layers[-1] = wrapper_out.original_conv
 
 
@@ -384,10 +433,14 @@ def load_conditioned_lora(model, path):
 
 
 def merge_lora(model):
-    """Fold LoRA weights into the original Conv1d and remove wrappers.
+    """Fold LoRA weights into the original conv layers and remove wrappers.
 
     After merging, the model runs at full speed with no LoRA overhead.
     This is irreversible -- the original weights are modified in place.
+
+    Supports both LoRAConv1d (attention) and LoRAConv2d (resblock).
+    For Conv1d: W_merged = W_original + scaling * up @ down  (matmul on [out,r] @ [r,in])
+    For Conv2d: W_merged = W_original + scaling * up * down  (1x1 conv weight reshape)
     """
     unet = model.model.model
     for module in unet.modules():
@@ -395,10 +448,21 @@ def merge_lora(model):
             for attr_name in ("qkv", "proj_out"):
                 wrapper = getattr(module, attr_name)
                 if isinstance(wrapper, LoRAConv1d):
-                    # W_merged = W_original + scaling * up @ down
                     with torch.no_grad():
                         merged = (wrapper.scaling
                                   * wrapper.lora_up.weight.data
                                   @ wrapper.lora_down.weight.data)
                         wrapper.original_conv.weight.data.add_(merged)
                     setattr(module, attr_name, wrapper.original_conv)
+
+        if isinstance(module, ResBlock):
+            for layer_list in (module.in_layers, module.out_layers):
+                wrapper = layer_list[-1]
+                if isinstance(wrapper, LoRAConv2d):
+                    with torch.no_grad():
+                        # 1x1 conv weights: [out, in, 1, 1] -> matmul on [out,r] @ [r,in]
+                        up_w = wrapper.lora_up.weight.data.squeeze(-1).squeeze(-1)
+                        down_w = wrapper.lora_down.weight.data.squeeze(-1).squeeze(-1)
+                        merged = (wrapper.scaling * up_w @ down_w).unsqueeze(-1).unsqueeze(-1)
+                        wrapper.original_conv.weight.data.add_(merged)
+                    layer_list[-1] = wrapper.original_conv
