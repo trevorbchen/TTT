@@ -596,15 +596,7 @@ def evaluate_held_out(net, scheduler, forward_op, eval_images,
     # Save
     with open(str(root / "eval_results.json"), "w") as f:
         json.dump(results, f, indent=2)
-    torch.save({
-        "lora_recons": torch.cat(lora_recons),
-        "plain_recons": torch.cat(plain_recons),
-        "eval_images": eval_images[:n_eval].cpu(),
-        "eval_measurements": eval_measurements[:n_eval].cpu(),
-        "lora_losses": lora_losses,
-        "plain_losses": plain_losses,
-    }, str(root / "eval_data.pt"))
-    logger.log(f"  Saved eval_results.json + eval_data.pt")
+    logger.log(f"  Saved eval_results.json")
 
     # Comparison plot
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
@@ -620,6 +612,30 @@ def evaluate_held_out(net, scheduler, forward_op, eval_images,
     plt.tight_layout()
     plt.savefig(str(root / "eval_comparison.png"), dpi=150)
     plt.close()
+
+    # Sample grid: 8 examples, columns = GT / LoRA / Plain
+    n_grid = min(8, n_eval)
+    fig, axes = plt.subplots(n_grid, 3, figsize=(9, 3 * n_grid))
+    if n_grid == 1:
+        axes = axes[None, :]
+    for i in range(n_grid):
+        gt = eval_images[i].cpu().squeeze().numpy()
+        lora_img = lora_recons[i].squeeze().numpy()
+        plain_img = plain_recons[i].squeeze().numpy()
+        axes[i, 0].imshow(gt, cmap='viridis')
+        axes[i, 0].set_title(f"GT #{i}" if i == 0 else "")
+        axes[i, 0].axis('off')
+        axes[i, 1].imshow(lora_img, cmap='viridis')
+        axes[i, 1].set_title(f"LoRA (loss={lora_losses[i]:.3f})" if i == 0 else f"{lora_losses[i]:.3f}")
+        axes[i, 1].axis('off')
+        axes[i, 2].imshow(plain_img, cmap='viridis')
+        axes[i, 2].set_title(f"Plain (loss={plain_losses[i]:.3f})" if i == 0 else f"{plain_losses[i]:.3f}")
+        axes[i, 2].axis('off')
+    plt.suptitle(f"Sample Grid — LoRA avg={np.mean(lora_losses):.4f}, Plain avg={np.mean(plain_losses):.4f}")
+    plt.tight_layout()
+    plt.savefig(str(root / "sample_grid.png"), dpi=150, bbox_inches='tight')
+    plt.close()
+    logger.log(f"  Saved sample_grid.png ({n_grid} samples)")
 
     return results
 
