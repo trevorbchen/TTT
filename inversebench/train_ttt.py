@@ -517,11 +517,12 @@ def grpo_loss_batch(net, lora_modules, candidates, advantages,
 
 @torch.no_grad()
 def evaluate_held_out(net, scheduler, forward_op, eval_images,
-                      eval_measurements, lora_modules, store, root, logger):
+                      eval_measurements, lora_modules, store, root, logger,
+                      max_eval=200):
     device = eval_images.device
-    n_eval = len(eval_images)
+    n_eval = min(len(eval_images), max_eval)
     logger.log(f"{'='*60}")
-    logger.log(f"Evaluating on {n_eval} held-out samples...")
+    logger.log(f"Evaluating on {n_eval} held-out samples (of {len(eval_images)})...")
     logger.log(f"{'='*60}")
 
     lora_losses, plain_losses = [], []
@@ -598,8 +599,8 @@ def evaluate_held_out(net, scheduler, forward_op, eval_images,
     torch.save({
         "lora_recons": torch.cat(lora_recons),
         "plain_recons": torch.cat(plain_recons),
-        "eval_images": eval_images.cpu(),
-        "eval_measurements": eval_measurements.cpu(),
+        "eval_images": eval_images[:n_eval].cpu(),
+        "eval_measurements": eval_measurements[:n_eval].cpu(),
         "lora_losses": lora_losses,
         "plain_losses": plain_losses,
     }, str(root / "eval_data.pt"))
