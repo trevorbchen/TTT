@@ -60,14 +60,18 @@ echo "  Copied: classifier.py, algo/ttt_cbg.py, train_cbg.py, configs"
 
 # --- 3. Setup Python environment ---
 cd "$IB_DIR"
+if ! command -v uv &>/dev/null; then
+    echo ">>> Installing uv..."
+    curl -LsSf https://astral.sh/uv/install.sh | sh
+    export PATH="$HOME/.local/bin:$PATH"
+fi
 if [ ! -d ".venv" ]; then
     echo ">>> Creating venv..."
-    python3 -m venv .venv
+    uv venv .venv --python python3
 fi
 source .venv/bin/activate
 echo ">>> Installing dependencies..."
-pip install -e . 2>&1 | tail -5
-pip install pyyaml 2>&1 | tail -1
+uv pip install -e . --extra-index-url https://download.pytorch.org/whl/cu124
 
 # --- 4. Download inv-scatter model checkpoint ---
 mkdir -p checkpoints
