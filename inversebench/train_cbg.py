@@ -95,8 +95,8 @@ class Logger:
 
 def sample_sigma(net, batch_size, device):
     """Sample noise levels log-uniformly between sigma_min and sigma_max."""
-    sigma_min = net.sigma_min
-    sigma_max = net.sigma_max
+    sigma_min = net.sigma_min if net.sigma_min > 0 else 0.01
+    sigma_max = net.sigma_max if net.sigma_max < float('inf') else 100.0
     log_sigma = torch.rand(batch_size, device=device) * (
         math.log(sigma_max) - math.log(sigma_min)
     ) + math.log(sigma_min)

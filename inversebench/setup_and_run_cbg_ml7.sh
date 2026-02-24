@@ -71,7 +71,16 @@ if [ ! -d ".venv" ]; then
 fi
 source .venv/bin/activate
 echo ">>> Installing dependencies..."
-uv pip install torch torchvision hydra-core omegaconf lmdb numpy tqdm pyyaml matplotlib piq requests
+uv pip install torch torchvision hydra-core omegaconf lmdb numpy tqdm pyyaml matplotlib piq requests scipy sigpy h5py accelerate wandb
+
+# --- 3b. Symlink scattering matrix cache (avoids 40+ min recomputation) ---
+CACHE_SRC="/home/wenda/InverseBench/cache/inv-scatter_numT_20_numR_360"
+CACHE_DST="cache/inv-scatter_numT_20_numR_360"
+if [ -d "$CACHE_SRC" ] && [ ! -e "$CACHE_DST" ]; then
+    mkdir -p cache
+    ln -sf "$CACHE_SRC" "$CACHE_DST"
+    echo "  Symlinked scattering cache from $CACHE_SRC"
+fi
 
 # --- 4. Download inv-scatter model checkpoint ---
 mkdir -p checkpoints
