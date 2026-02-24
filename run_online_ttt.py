@@ -1,23 +1,25 @@
 """
-Online amortized test-time training with LoRA and replay buffer.
+Online amortized test-time training with DPS-guided DRaFT and replay buffer.
 
 LoRA is initialized once and persists across test instances.  For each
 incoming measurement y_i the pipeline:
-  1. Samples x_0 via DRaFT (plain diffusion, grad through last K steps)
+  1. Samples x_0 via DPS-guided DRaFT (DPS guidance at every step,
+     grad through last K steps for LoRA update)
   2. Computes the DRaFT reward  r = -||A(x_0) - y||^2
   3. Appends (x_0, y_i) to a persistent replay buffer
   4. Samples a mini-batch from the buffer, noises the stored x_0 to a
      random sigma, denoises, and computes a measurement-consistency loss
   5. Updates LoRA with (current DRaFT loss + buffer replay loss)
 
-Later instances benefit from knowledge accumulated in earlier rounds
-(the "amortization curve").
+DPS guidance gradient (∇_{x_t}||A(x̂_0)-y||²) is always detached from
+the LoRA backward graph — it only modifies the sampling trajectory.
+DRaFT backward flows through the last K ODE steps to LoRA parameters.
 
 Usage:
   python run_online_ttt.py \
       data=test-imagenet model=imagenet256ddpm \
       sampler=edm_dps task=gaussian_blur \
-      +ttt.lora_rank=4 +ttt.lr=1e-3 +ttt.num_draft_rounds=1 \
+      +ttt.lora_rank=4 +ttt.lr=1e-3 +ttt.guidance_scale=1.0 \
       name=online_ttt_blur
 """
 
@@ -45,9 +47,12 @@ from lora import (apply_lora, remove_lora, get_lora_params, save_lora,
 # Sampling helpers
 # ---------------------------------------------------------------------------
 
-@torch.no_grad()
-def plain_diffusion_sample(model, scheduler, device):
-    """Plain PF-ODE Euler sampling (no guidance, no grad)."""
+def dps_sample(model, scheduler, forward_op, y, device, guidance_scale=1.0):
+    """DPS-guided PF-ODE Euler sampling (no grad, for final clean sample).
+
+    Every step applies DPS measurement guidance. Uses requires_grad_ toggling
+    for checkpoint-compatible autograd.grad, but no persistent graph is built.
+    """
     in_shape = model.get_in_shape()
     x = torch.randn(1, *in_shape, device=device) * scheduler.get_prior_sigma()
     sigma_steps = scheduler.sigma_steps
@@ -63,19 +68,35 @@ def plain_diffusion_sample(model, scheduler, device):
         dst = scheduler.get_scaling_derivative(t)
         dsigma = scheduler.get_sigma_derivative(t)
 
-        x0hat = model.tweedie(x / st, sigma)
-        score = (x0hat - x / st) / sigma ** 2
-        deriv = dst / st * x - st * dsigma * sigma * score
-        x = x + dt * deriv
+        model.requires_grad_(True)
+        xt_in = x.detach().requires_grad_(True)
+        x0hat = model.tweedie(xt_in / st, sigma)
+        loss_dps = forward_op.loss(x0hat, y)
+        grad_xt = torch.autograd.grad(loss_dps.sum(), xt_in)[0]
+        model.requires_grad_(False)
+
+        with torch.no_grad():
+            norm_factor = loss_dps.sqrt().view(
+                -1, *([1] * (grad_xt.ndim - 1))).clamp(min=1e-8)
+            normalized_grad = grad_xt / norm_factor
+            score = (x0hat.detach() - x / st) / sigma ** 2
+            deriv = dst / st * x - st * dsigma * sigma * score
+            x = x + dt * deriv - guidance_scale * normalized_grad
 
     return x
 
 
-def draft_k_sample(model, scheduler, device, draft_k=1):
-    """Plain PF-ODE Euler sampling, differentiable through last draft_k steps.
+def dps_draft_k_sample(model, scheduler, forward_op, y, device,
+                       draft_k=1, guidance_scale=1.0):
+    """DPS-guided PF-ODE Euler sampling, differentiable through last draft_k steps.
+
+    Every step applies DPS measurement guidance ∇_{x_t}||A(x̂_0) - y||².
+    The last draft_k steps retain computation graph through LoRA parameters
+    for DRaFT backward.  DPS guidance gradient is always detached from the
+    LoRA graph — it only modifies the sampling trajectory.
 
     Returns x_0 whose grad graph connects to LoRA parameters through the
-    last draft_k denoising steps.
+    last draft_k denoising steps (but NOT through DPS guidance).
     """
     in_shape = model.get_in_shape()
     x = torch.randn(1, *in_shape, device=device) * scheduler.get_prior_sigma()
@@ -94,19 +115,41 @@ def draft_k_sample(model, scheduler, device, draft_k=1):
         dsigma = scheduler.get_sigma_derivative(t)
 
         if i < grad_start:
+            # --- Prefix: DPS guidance only, no LoRA graph ---
+            model.requires_grad_(True)
+            xt_in = x.detach().requires_grad_(True)
+            x0hat = model.tweedie(xt_in / st, sigma)
+            loss_dps = forward_op.loss(x0hat, y)
+            grad_xt = torch.autograd.grad(loss_dps.sum(), xt_in)[0]
+            model.requires_grad_(False)
+
             with torch.no_grad():
-                x0hat = model.tweedie(x / st, sigma)
-                score = (x0hat - x / st) / sigma ** 2
+                norm_factor = loss_dps.sqrt().view(
+                    -1, *([1] * (grad_xt.ndim - 1))).clamp(min=1e-8)
+                normalized_grad = grad_xt / norm_factor
+                score = (x0hat.detach() - x / st) / sigma ** 2
                 deriv = dst / st * x - st * dsigma * sigma * score
-                x = x + dt * deriv
+                x = x + dt * deriv - guidance_scale * normalized_grad
         else:
+            # --- Suffix: DPS guidance + LoRA graph retained for DRaFT ---
             if i == grad_start:
-                x = x.detach()
-            # grad flows through model.tweedie → LoRA params
+                x = x.detach()  # cut prefix graph
+
+            # Single forward: graph connects x → model.tweedie → LoRA params
             x0hat = model.tweedie(x / st, sigma)
+
+            # DPS guidance (retain_graph for DRaFT chain)
+            loss_dps = forward_op.loss(x0hat, y)
+            grad_xt = torch.autograd.grad(
+                loss_dps.sum(), x, retain_graph=True)[0]
+            norm_factor = loss_dps.detach().sqrt().view(
+                -1, *([1] * (grad_xt.ndim - 1))).clamp(min=1e-8)
+            normalized_grad = (grad_xt / norm_factor).detach()
+
+            # ODE step — graph retained for DRaFT backward through LoRA
             score = (x0hat - x / st) / sigma ** 2
             deriv = dst / st * x - st * dsigma * sigma * score
-            x = x + dt * deriv
+            x = x + dt * deriv - guidance_scale * normalized_grad
 
     return x
 
@@ -219,6 +262,7 @@ def main(args: DictConfig):
     buffer_batch_size = ttt.get("buffer_batch_size", 4)
     buffer_max_size = ttt.get("buffer_max_size", 10000)
     lambda_buffer = ttt.get("lambda_buffer", 1.0)
+    guidance_scale = ttt.get("guidance_scale", 1.0)
     skip_baseline = ttt.get("skip_baseline", False)
 
     # --- data ---
@@ -281,6 +325,7 @@ def main(args: DictConfig):
     print(f"Online TTT ({total_number} instances)")
     print(f"  rank={lora_rank}  alpha={lora_alpha}  lr={lr}")
     print(f"  draft_k={draft_k}  rounds={num_draft_rounds}")
+    print(f"  guidance_scale={guidance_scale}")
     print(f"  buffer_batch={buffer_batch_size}  lambda_buf={lambda_buffer}")
     print(f"{'='*60}")
 
@@ -307,8 +352,10 @@ def main(args: DictConfig):
         for rnd in range(num_draft_rounds):
             optimizer.zero_grad()
 
-            # DRaFT sample: plain diffusion, grad through last draft_k steps
-            x_0 = draft_k_sample(model, scheduler, device, draft_k=draft_k)
+            # DRaFT sample: DPS-guided, grad through last draft_k steps
+            x_0 = dps_draft_k_sample(model, scheduler, operator, y_i,
+                                     device, draft_k=draft_k,
+                                     guidance_scale=guidance_scale)
 
             # Current-instance DRaFT loss
             loss_current = operator.loss(x_0, y_i).mean()
@@ -325,9 +372,9 @@ def main(args: DictConfig):
             torch.nn.utils.clip_grad_norm_(lora_params, grad_clip)
             optimizer.step()
 
-        # Final clean sample with updated LoRA (no grad)
-        with torch.no_grad():
-            x_final = plain_diffusion_sample(model, scheduler, device)
+        # Final clean sample with updated LoRA (no grad, DPS-guided)
+        x_final = dps_sample(model, scheduler, operator, y_i, device,
+                             guidance_scale=guidance_scale)
 
         # (2) Append to buffer
         buffer_D.add(x_final, y_i)
@@ -390,6 +437,7 @@ def main(args: DictConfig):
                         "draft_k": draft_k,
                         "num_draft_rounds": num_draft_rounds,
                         "buffer_batch_size": buffer_batch_size,
+                        "guidance_scale": guidance_scale,
                         "num_instances_seen": total_number})
 
     remove_lora(model)
@@ -483,6 +531,7 @@ def main(args: DictConfig):
             "draft_k": draft_k, "num_draft_rounds": num_draft_rounds,
             "buffer_batch_size": buffer_batch_size,
             "lambda_buffer": lambda_buffer,
+            "guidance_scale": guidance_scale,
         },
         "aggregate": aggregate,
         "per_image": all_metrics,
