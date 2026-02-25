@@ -8,7 +8,8 @@ from hydra import compose, initialize_config_dir
 from hydra.utils import instantiate
 from utils.scheduler import Scheduler
 
-initialize_config_dir(config_dir="configs", version_base="1.3")
+import os
+initialize_config_dir(config_dir=os.path.join(os.getcwd(), "configs"), version_base="1.3")
 config = compose(config_name="config", overrides=["problem=inv-scatter", "pretrain=inv-scatter"])
 
 device = torch.device("cuda")
