@@ -90,22 +90,37 @@ class MeasurementDecoder(nn.Module):
     (e.g. 64) rather than out_channels (e.g. 1), avoiding a severe
     information bottleneck.
 
-    Architecture: AdaptiveAvgPool2d → Flatten → Linear → GELU → Linear
-    With base_channels=64, pool_size=8: pool_dim=4096 → 512 → meas_flat_dim
+    Architecture: AdaptiveAvgPool2d → Flatten → [Linear → LN → GELU] x2 → Linear
+    With base_channels=64, pool_size=8, hidden=2048:
+        pool_dim=4096 → 2048 → 2048 → meas_flat_dim
     """
 
-    def __init__(self, in_channels: int, meas_flat_dim: int, pool_size: int = 8):
+    def __init__(self, in_channels: int, meas_flat_dim: int,
+                 pool_size: int = 8, hidden: int = 2048):
         super().__init__()
         self.meas_flat_dim = meas_flat_dim
         self.pool = nn.AdaptiveAvgPool2d(pool_size)
         pool_dim = in_channels * pool_size * pool_size
-        bottleneck = min(pool_dim, 512)
+        hidden = min(pool_dim, hidden)
         self.proj = nn.Sequential(
             nn.Flatten(1),
-            nn.Linear(pool_dim, bottleneck),
+            nn.Linear(pool_dim, hidden),
+            nn.LayerNorm(hidden),
             nn.GELU(),
-            nn.Linear(bottleneck, meas_flat_dim),
+            nn.Linear(hidden, hidden),
+            nn.LayerNorm(hidden),
+            nn.GELU(),
+            nn.Linear(hidden, meas_flat_dim),
         )
+        # Kaiming init for hidden layers, small init for output layer
+        for m in self.proj:
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+        # Small init on output layer so decoder starts near zero
+        out_layer = self.proj[-1]
+        nn.init.normal_(out_layer.weight, std=0.01)
 
     def forward(self, h):
         return self.proj(self.pool(h))
@@ -271,7 +286,8 @@ class MeasurementPredictor(nn.Module):
                  channel_mult=(1, 2, 4, 4), attn_heads=4,
                  obs_shape: Optional[Tuple[int, ...]] = None,
                  img_resolution: Optional[int] = None,
-                 meas_flat_dim: Optional[int] = None):
+                 meas_flat_dim: Optional[int] = None,
+                 decoder_hidden: int = 2048):
         """
         Args:
             obs_shape: Shape of a single observation *without* batch dim,
@@ -285,6 +301,7 @@ class MeasurementPredictor(nn.Module):
                            provided with obs_shape, a MeasurementDecoder maps
                            UNet output back to measurement space so the loss
                            is computed there (not in the inflated spatial space).
+            decoder_hidden: Hidden dim for MeasurementDecoder (default 2048).
         """
         super().__init__()
         self.in_channels = in_channels
@@ -296,6 +313,7 @@ class MeasurementPredictor(nn.Module):
         self.channel_mult = list(channel_mult)
         self.obs_shape = obs_shape
         self.meas_flat_dim = meas_flat_dim
+        self.decoder_hidden = decoder_hidden
 
         # Build measurement encoder for non-image observations
         if obs_shape is not None:
@@ -310,7 +328,7 @@ class MeasurementPredictor(nn.Module):
         # Uses base_channels (not out_channels) because it's applied before out_conv
         if obs_shape is not None and meas_flat_dim is not None:
             self.measurement_decoder = MeasurementDecoder(
-                base_channels, meas_flat_dim)
+                base_channels, meas_flat_dim, hidden=decoder_hidden)
         else:
             self.measurement_decoder = None
 
@@ -468,6 +486,7 @@ def save_classifier(classifier, path, metadata=None):
         config['img_resolution'] = classifier.measurement_encoder.img_resolution
     if classifier.meas_flat_dim is not None:
         config['meas_flat_dim'] = classifier.meas_flat_dim
+        config['decoder_hidden'] = classifier.decoder_hidden
     checkpoint = {
         'state_dict': classifier.state_dict(),
         'config': config,

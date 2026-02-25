@@ -288,6 +288,8 @@ def main(config: DictConfig):
     save_dir      = cbg.get("save_dir", "exps/cbg")
     target_mode   = cbg.get("target_mode", "tweedie")  # "tweedie" or "direct"
     normalize_target = cbg.get("normalize_target", True)
+    decoder_hidden = cbg.get("decoder_hidden", 2048)
+    warmup_epochs  = cbg.get("warmup_epochs", 5)
     assert target_mode in ("tweedie", "direct"), \
         f"Unknown target_mode={target_mode!r}, expected 'tweedie' or 'direct'"
 
@@ -300,8 +302,9 @@ def main(config: DictConfig):
     logger = Logger(root)
     logger.log(f"CBG Training for InverseBench")
     logger.log(f"  target_mode={target_mode}, normalize_target={normalize_target}, "
-               f"base_channels={base_channels}, "
-               f"lr={lr}, epochs={num_epochs}, train_pct={train_pct}")
+               f"base_channels={base_channels}, decoder_hidden={decoder_hidden}, "
+               f"lr={lr}, epochs={num_epochs}, train_pct={train_pct}, "
+               f"warmup={warmup_epochs}")
     logger.log(f"  output: {root}")
     logger.log(f"  device: {device}")
     logger.update_progress(status="loading", total_epochs=num_epochs)
@@ -406,16 +409,32 @@ def main(config: DictConfig):
         obs_shape=obs_shape,
         img_resolution=net.img_resolution,
         meas_flat_dim=meas_flat_dim if not is_image_obs else None,
+        decoder_hidden=decoder_hidden,
     ).to(device)
 
     num_params = sum(p.numel() for p in classifier.parameters())
-    logger.log(f"MeasurementPredictor: {num_params/1e6:.2f}M parameters")
+    dec_params = sum(p.numel() for p in classifier.measurement_decoder.parameters()) \
+        if classifier.measurement_decoder is not None else 0
+    logger.log(f"MeasurementPredictor: {num_params/1e6:.2f}M parameters "
+               f"(decoder: {dec_params/1e6:.2f}M)")
 
     # --- 5. Optimizer & scheduler ---
     optimizer = torch.optim.AdamW(classifier.parameters(), lr=lr,
                                   weight_decay=weight_decay)
-    lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=max(num_epochs, 10), eta_min=lr * 0.01)
+    # LR warmup + cosine decay
+    warmup_steps = max(warmup_epochs, 0)
+    if warmup_steps > 0 and num_epochs > warmup_steps:
+        warmup_sched = torch.optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=0.01, total_iters=warmup_steps)
+        cosine_sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=max(num_epochs - warmup_steps, 1),
+            eta_min=lr * 0.01)
+        lr_scheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimizer, [warmup_sched, cosine_sched],
+            milestones=[warmup_steps])
+    else:
+        lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=max(num_epochs, 10), eta_min=lr * 0.01)
 
     # --- 6. Train ---
     step_losses = []
