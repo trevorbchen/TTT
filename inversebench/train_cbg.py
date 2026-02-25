@@ -236,7 +236,7 @@ def evaluate_held_out(classifier, net, forward_op, eval_images,
             target = target / tnorm
         pred = classifier(x_noisy, sigma, y_batch)
 
-        total_pred_loss += F.mse_loss(pred, target).item()
+        total_pred_loss += (pred - target).pow(2).flatten(1).sum(-1).mean().item()
         total_target_loss += target.norm().item()
         num_batches += 1
 
@@ -281,7 +281,7 @@ def main(config: DictConfig):
     weight_decay  = cbg.get("weight_decay", 1e-4)
     batch_size    = cbg.get("batch_size", 8)
     num_epochs    = cbg.get("num_epochs", 50)
-    grad_clip     = cbg.get("grad_clip", 1.0)
+    grad_clip     = cbg.get("grad_clip", 10.0)
     train_pct     = cbg.get("train_pct", 10)
     val_fraction  = cbg.get("val_fraction", 0.1)
     save_every    = cbg.get("save_every", 10)
@@ -468,7 +468,9 @@ def main(config: DictConfig):
                     target = target / tnorm
 
             pred = classifier(x_noisy, sigma, y_batch)
-            loss = F.mse_loss(pred, target)
+            # Per-sample sum loss (not MSE mean) — prevents gradient vanishing
+            # when measurement dim D is large (MSE divides by D, shrinking grads)
+            loss = (pred - target).pow(2).flatten(1).sum(-1).mean()
             optimizer.zero_grad()
             loss.backward()
             gn = torch.nn.utils.clip_grad_norm_(
@@ -479,7 +481,7 @@ def main(config: DictConfig):
             loss_val = loss.item()
             # Track relative error: ||pred - target||² / ||target||²
             with torch.no_grad():
-                target_energy = target.pow(2).mean().item()
+                target_energy = target.pow(2).flatten(1).sum(-1).mean().item()
                 rel_err = loss_val / max(target_energy, 1e-10)
             step_losses.append(loss_val)
             epoch_loss += loss_val
@@ -523,7 +525,7 @@ def main(config: DictConfig):
                         tnorm = target.norm(dim=-1, keepdim=True).clamp(min=1e-8)
                         target = target / tnorm
                     pred = classifier(x_noisy, sigma, y_batch)
-                    val_loss += F.mse_loss(pred, target).item()
+                    val_loss += (pred - target).pow(2).flatten(1).sum(-1).mean().item()
                     val_batches += 1
 
         avg_val_loss = val_loss / max(val_batches, 1) if val_batches > 0 \

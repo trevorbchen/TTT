@@ -12,7 +12,7 @@ lr: 1e-4
 weight_decay: 1e-4
 batch_size: 8
 num_epochs: 50
-grad_clip: 1.0
+grad_clip: 10.0
 
 # Data
 train_pct: 10
