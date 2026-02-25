@@ -87,13 +87,17 @@ def dps_sample(model, scheduler, forward_op, y, device, guidance_scale=1.0):
 
 
 def dps_draft_k_sample(model, scheduler, forward_op, y, device,
-                       draft_k=1, guidance_scale=1.0):
+                       draft_k=1, guidance_scale=1.0, lora_params=None):
     """DPS-guided PF-ODE Euler sampling, differentiable through last draft_k steps.
 
     Every step applies DPS measurement guidance ∇_{x_t}||A(x̂_0) - y||².
     The last draft_k steps retain computation graph through LoRA parameters
     for DRaFT backward.  DPS guidance gradient is always detached from the
     LoRA graph — it only modifies the sampling trajectory.
+
+    Args:
+        lora_params: list of LoRA parameter tensors. Needed to restore their
+            requires_grad after prefix steps toggle model.requires_grad_(False).
 
     Returns x_0 whose grad graph connects to LoRA parameters through the
     last draft_k denoising steps (but NOT through DPS guidance).
@@ -133,7 +137,12 @@ def dps_draft_k_sample(model, scheduler, forward_op, y, device,
         else:
             # --- Suffix: DPS guidance + LoRA graph retained for DRaFT ---
             if i == grad_start:
-                x = x.detach()  # cut prefix graph
+                x = x.detach().requires_grad_(True)
+                # Prefix set model.requires_grad_(False) which disabled LoRA
+                # params. Re-enable them for the DRaFT computation graph.
+                if lora_params is not None:
+                    for p in lora_params:
+                        p.requires_grad_(True)
 
             # Single forward: graph connects x → model.tweedie → LoRA params
             x0hat = model.tweedie(x / st, sigma)
@@ -355,7 +364,8 @@ def main(args: DictConfig):
             # DRaFT sample: DPS-guided, grad through last draft_k steps
             x_0 = dps_draft_k_sample(model, scheduler, operator, y_i,
                                      device, draft_k=draft_k,
-                                     guidance_scale=guidance_scale)
+                                     guidance_scale=guidance_scale,
+                                     lora_params=lora_params)
 
             # Current-instance DRaFT loss
             loss_current = operator.loss(x_0, y_i).mean()
