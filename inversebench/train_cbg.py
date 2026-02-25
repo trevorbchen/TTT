@@ -195,7 +195,7 @@ def save_loss_curves(step_losses, epoch_train, epoch_val, grad_norms, root):
 @torch.no_grad()
 def evaluate_held_out(classifier, net, forward_op, eval_images,
                       eval_measurements, root, logger, batch_size=4,
-                      target_mode="tweedie"):
+                      target_mode="tweedie", normalize_target=True):
     """Evaluate classifier quality on held-out data."""
     device = eval_images.device
     n_eval = len(eval_images)
@@ -231,6 +231,9 @@ def evaluate_held_out(classifier, net, forward_op, eval_images,
                 target = residual.flatten(1).float()
         else:
             target = residual
+        if normalize_target:
+            tnorm = target.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+            target = target / tnorm
         pred = classifier(x_noisy, sigma, y_batch)
 
         total_pred_loss += F.mse_loss(pred, target).item()
@@ -284,6 +287,7 @@ def main(config: DictConfig):
     save_every    = cbg.get("save_every", 10)
     save_dir      = cbg.get("save_dir", "exps/cbg")
     target_mode   = cbg.get("target_mode", "tweedie")  # "tweedie" or "direct"
+    normalize_target = cbg.get("normalize_target", True)
     assert target_mode in ("tweedie", "direct"), \
         f"Unknown target_mode={target_mode!r}, expected 'tweedie' or 'direct'"
 
@@ -295,7 +299,8 @@ def main(config: DictConfig):
     # --- Logger ---
     logger = Logger(root)
     logger.log(f"CBG Training for InverseBench")
-    logger.log(f"  target_mode={target_mode}, base_channels={base_channels}, "
+    logger.log(f"  target_mode={target_mode}, normalize_target={normalize_target}, "
+               f"base_channels={base_channels}, "
                f"lr={lr}, epochs={num_epochs}, train_pct={train_pct}")
     logger.log(f"  output: {root}")
     logger.log(f"  device: {device}")
@@ -457,6 +462,10 @@ def main(config: DictConfig):
                         target = residual.flatten(1).float()
                 else:
                     target = residual
+                # Per-sample normalization: classifier learns direction, not magnitude
+                if normalize_target:
+                    tnorm = target.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+                    target = target / tnorm
 
             pred = classifier(x_noisy, sigma, y_batch)
             loss = F.mse_loss(pred, target)
@@ -510,6 +519,9 @@ def main(config: DictConfig):
                             target = residual.flatten(1).float()
                     else:
                         target = residual
+                    if normalize_target:
+                        tnorm = target.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+                        target = target / tnorm
                     pred = classifier(x_noisy, sigma, y_batch)
                     val_loss += F.mse_loss(pred, target).item()
                     val_batches += 1
@@ -562,6 +574,7 @@ def main(config: DictConfig):
                               "problem": problem_name,
                               "train_pct": train_pct,
                               "target_mode": target_mode,
+                              "normalize_target": normalize_target,
                               "best_val_loss": best_val_loss,
                               "final_train_loss": epoch_train_losses[-1],
                               "final_val_loss": epoch_val_losses[-1]})
@@ -573,7 +586,8 @@ def main(config: DictConfig):
         evaluate_held_out(classifier, net, forward_op,
                           eval_images, eval_measurements,
                           root, logger, batch_size=batch_size,
-                          target_mode=target_mode)
+                          target_mode=target_mode,
+                          normalize_target=normalize_target)
 
     logger.update_progress(status="done")
     logger.log(f"")
