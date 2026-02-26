@@ -5,13 +5,14 @@ Usage:
         +ttt.lora_path=exps/ttt/.../lora_final.pt \
         +ttt.num_eval=8 +ttt.eval_out=quick_eval.png
 """
+import os
 import hydra
 import torch
 import pickle
 import numpy as np
 import matplotlib.pyplot as plt
 from omegaconf import DictConfig, OmegaConf
-from hydra.utils import instantiate
+from hydra.utils import instantiate, get_original_cwd
 from utils.helper import open_url
 from algo.lora import load_conditioned_lora
 from utils.scheduler import Scheduler

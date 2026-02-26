@@ -38,17 +38,24 @@ class MeasurementEncoder(nn.Module):
     to [B, y_channels, H, W] spatial features that can be concatenated with
     x_t in the classifier's input conv.
 
+    Projects to a small spatial size (default 32x32) then lets the caller
+    bilinearly upsample. This avoids a massive Linear layer when
+    img_resolution is large (e.g. 256x256 = 262k output dim → 537M params).
+
     For complex inputs, real and imaginary parts are stacked as channels.
     Builds lazily on first forward (input dim depends on complex vs real).
     """
 
     def __init__(self, obs_shape: Tuple[int, ...], y_channels: int,
-                 img_resolution: int):
+                 img_resolution: int, enc_spatial_size: Optional[int] = None):
         super().__init__()
         self.obs_shape = obs_shape
         self.y_channels = y_channels
         self.img_resolution = img_resolution
-        self._spatial_out = y_channels * img_resolution * img_resolution
+        # Internal projection spatial size. None → img_resolution for backwards
+        # compat with old checkpoints. New models should pass 32 explicitly.
+        self.enc_spatial_size = enc_spatial_size if enc_spatial_size is not None else img_resolution
+        self._spatial_out = y_channels * self.enc_spatial_size * self.enc_spatial_size
         self._built = False
         self._in_dim = None
         # placeholder so state_dict is non-empty before build
@@ -75,8 +82,8 @@ class MeasurementEncoder(nn.Module):
             self._build(y.shape[1], y.device)
 
         out = self.proj(y)
-        return out.view(B, self.y_channels, self.img_resolution,
-                        self.img_resolution)
+        return out.view(B, self.y_channels, self.enc_spatial_size,
+                        self.enc_spatial_size)
 
 
 # ---------------------------------------------------------------------------
@@ -256,6 +263,83 @@ class SelfAttention(nn.Module):
         return (x_flat + h).reshape(b, c, *spatial)
 
 
+class CrossAttention(nn.Module):
+    """
+    Multi-head cross-attention: Q from spatial features, K/V from context tokens.
+
+    Lets the UNet attend to measurement-derived tokens at the bottleneck,
+    rather than relying solely on input-level concatenation.
+    Zero-initialized output projection so the block starts as identity.
+    """
+
+    def __init__(self, channels, context_dim, num_heads=4):
+        super().__init__()
+        assert channels % num_heads == 0
+        self.num_heads = num_heads
+        self.head_dim = channels // num_heads
+
+        self.norm = nn.GroupNorm(min(32, channels), channels)
+        self.q_proj = nn.Conv1d(channels, channels, 1)
+        self.kv_proj = nn.Linear(context_dim, channels * 2)
+        self.out_proj = zero_module(nn.Conv1d(channels, channels, 1))
+
+    def forward(self, x, context):
+        """
+        Args:
+            x:       [B, C, H, W] spatial features
+            context: [B, N_tokens, context_dim]
+        """
+        b, c, *spatial = x.shape
+        x_flat = x.reshape(b, c, -1)                    # [B, C, HW]
+
+        h = self.norm(x_flat)
+        q = self.q_proj(h)                               # [B, C, HW]
+        kv = self.kv_proj(context).transpose(1, 2)       # [B, 2C, N]
+        k, v = kv.chunk(2, dim=1)
+
+        q = q.reshape(b, self.num_heads, self.head_dim, -1)
+        k = k.reshape(b, self.num_heads, self.head_dim, -1)
+        v = v.reshape(b, self.num_heads, self.head_dim, -1)
+
+        scale = self.head_dim ** -0.5
+        attn = torch.einsum('bhdn,bhdm->bhnm', q * scale, k)
+        attn = attn.softmax(dim=-1)
+        h = torch.einsum('bhnm,bhdm->bhdn', attn, v)
+        h = h.reshape(b, c, -1)
+
+        h = self.out_proj(h)
+        return (x_flat + h).reshape(b, c, *spatial)
+
+
+class MeasurementTokenizer(nn.Module):
+    """Encodes raw measurements into a sequence of tokens for cross-attention.
+
+    Maps measurements of any shape (e.g. [B, 20, 360] complex) to
+    [B, num_tokens, token_dim] via flatten -> Linear -> reshape.
+    """
+
+    def __init__(self, meas_flat_dim: int, token_dim: int, num_tokens: int = 64):
+        super().__init__()
+        self.num_tokens = num_tokens
+        self.token_dim = token_dim
+        out_dim = token_dim * num_tokens
+        hidden = min(meas_flat_dim, out_dim, 2048)
+        self.proj = nn.Sequential(
+            nn.Linear(meas_flat_dim, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, out_dim),
+        )
+
+    def forward(self, y):
+        B = y.shape[0]
+        if y.is_complex():
+            y = torch.view_as_real(y).flatten(1).float()
+        else:
+            y = y.flatten(1).float()
+        tokens = self.proj(y)
+        return tokens.view(B, self.num_tokens, self.token_dim)
+
+
 # ---------------------------------------------------------------------------
 # Main network
 # ---------------------------------------------------------------------------
@@ -287,7 +371,10 @@ class MeasurementPredictor(nn.Module):
                  obs_shape: Optional[Tuple[int, ...]] = None,
                  img_resolution: Optional[int] = None,
                  meas_flat_dim: Optional[int] = None,
-                 decoder_hidden: int = 2048):
+                 decoder_hidden: int = 2048,
+                 num_res_blocks: int = 1,
+                 num_tokens: int = 0,
+                 enc_spatial_size: Optional[int] = None):
         """
         Args:
             obs_shape: Shape of a single observation *without* batch dim,
@@ -302,6 +389,9 @@ class MeasurementPredictor(nn.Module):
                            UNet output back to measurement space so the loss
                            is computed there (not in the inflated spatial space).
             decoder_hidden: Hidden dim for MeasurementDecoder (default 2048).
+            num_res_blocks: Number of ResBlocks per encoder/decoder level (default 1).
+            num_tokens: Number of cross-attention tokens for measurement conditioning.
+                        0 disables cross-attention (default, backwards compatible).
         """
         super().__init__()
         self.in_channels = in_channels
@@ -314,13 +404,16 @@ class MeasurementPredictor(nn.Module):
         self.obs_shape = obs_shape
         self.meas_flat_dim = meas_flat_dim
         self.decoder_hidden = decoder_hidden
+        self.num_res_blocks = num_res_blocks
+        self.num_tokens = num_tokens
 
         # Build measurement encoder for non-image observations
         if obs_shape is not None:
             if img_resolution is None:
                 img_resolution = self.out_size[0]
             self.measurement_encoder = MeasurementEncoder(
-                obs_shape, y_channels, img_resolution)
+                obs_shape, y_channels, img_resolution,
+                enc_spatial_size=enc_spatial_size)
         else:
             self.measurement_encoder = None
 
@@ -331,6 +424,19 @@ class MeasurementPredictor(nn.Module):
                 base_channels, meas_flat_dim, hidden=decoder_hidden)
         else:
             self.measurement_decoder = None
+
+        # Build measurement tokenizer + cross-attention for bottleneck
+        if num_tokens > 0 and meas_flat_dim is not None:
+            bot_ch_for_xattn = base_channels * channel_mult[-1]
+            self.meas_tokenizer = MeasurementTokenizer(
+                meas_flat_dim, token_dim=bot_ch_for_xattn,
+                num_tokens=num_tokens)
+            self.bot_cross_attn = CrossAttention(
+                bot_ch_for_xattn, context_dim=bot_ch_for_xattn,
+                num_heads=attn_heads)
+        else:
+            self.meas_tokenizer = None
+            self.bot_cross_attn = None
 
         C = base_channels
         ch_list = [C * m for m in channel_mult]  # e.g. [64, 128, 256, 256]
@@ -353,32 +459,38 @@ class MeasurementPredictor(nn.Module):
         self.downsamples = nn.ModuleList()
         prev_ch = C
         for i, cur_ch in enumerate(ch_list):
-            self.enc_blocks.append(ResBlock(prev_ch, cur_ch, emb_dim))
+            # Stack num_res_blocks ResBlocks per level
+            level_blocks = nn.ModuleList()
+            for j in range(num_res_blocks):
+                level_blocks.append(ResBlock(
+                    prev_ch if j == 0 else cur_ch, cur_ch, emb_dim))
+            self.enc_blocks.append(level_blocks)
             self.downsamples.append(nn.Conv2d(cur_ch, cur_ch, 3, stride=2, padding=1))
             prev_ch = cur_ch
 
-        # -- bottleneck (ResBlock + Attention + ResBlock) ----------------------
+        # -- bottleneck (ResBlock + SelfAttention [+ CrossAttention] + ResBlock)
         self.bot_res1 = ResBlock(bot_ch, bot_ch, emb_dim)
         self.bot_attn = SelfAttention(bot_ch, num_heads=attn_heads)
         self.bot_res2 = ResBlock(bot_ch, bot_ch, emb_dim)
 
         # -- decoder -----------------------------------------------------------
-        # Decoder level i receives: upsample(prev) concatenated with skip_i
-        # and outputs the channel count for the next (higher-res) level.
         self.upsample_layers = nn.ModuleList()
         self.dec_blocks = nn.ModuleList()
 
-        # Iterate from deepest to shallowest
         dec_prev_ch = bot_ch
         for i in reversed(range(num_levels)):
             skip_ch = ch_list[i]
-            # Output channels: ch_list of one level higher, or C for the top
             if i > 0:
                 dec_out_ch = ch_list[i - 1]
             else:
                 dec_out_ch = C
             self.upsample_layers.append(nn.Upsample(scale_factor=2, mode='nearest'))
-            self.dec_blocks.append(ResBlock(dec_prev_ch + skip_ch, dec_out_ch, emb_dim))
+            # Stack num_res_blocks ResBlocks per decoder level
+            level_blocks = nn.ModuleList()
+            for j in range(num_res_blocks):
+                in_ch = (dec_prev_ch + skip_ch) if j == 0 else dec_out_ch
+                level_blocks.append(ResBlock(in_ch, dec_out_ch, emb_dim))
+            self.dec_blocks.append(level_blocks)
             dec_prev_ch = dec_out_ch
 
         # -- output head (zero-init so the network starts predicting zeros) ----
@@ -424,27 +536,36 @@ class MeasurementPredictor(nn.Module):
         else:
             y_in = y
 
+        # --- tokenize measurements for cross-attention ---
+        y_tokens = None
+        if self.meas_tokenizer is not None:
+            y_tokens = self.meas_tokenizer(y)             # [B, num_tokens, bot_ch]
+
         # --- input conv ---
         h = self.input_conv(torch.cat([x_t, y_in], dim=1))  # [B, C, 256, 256]
 
         # --- encoder ---
         skips = []
-        for enc, down in zip(self.enc_blocks, self.downsamples):
-            h = enc(h, emb)
+        for level_blocks, down in zip(self.enc_blocks, self.downsamples):
+            for blk in level_blocks:
+                h = blk(h, emb)
             skips.append(h)                               # save for decoder
             h = down(h)
 
         # --- bottleneck ---
         h = self.bot_res1(h, emb)
         h = self.bot_attn(h)
+        if self.bot_cross_attn is not None:
+            h = self.bot_cross_attn(h, y_tokens)
         h = self.bot_res2(h, emb)
 
         # --- decoder ---
-        for up, dec in zip(self.upsample_layers, self.dec_blocks):
+        for up, level_blocks in zip(self.upsample_layers, self.dec_blocks):
             h = up(h)
             skip = skips.pop()
             h = torch.cat([h, skip], dim=1)
-            h = dec(h, emb)
+            for blk in level_blocks:
+                h = blk(h, emb)
 
         # --- output ---
         h = self.out_norm(h)
@@ -480,10 +601,13 @@ def save_classifier(classifier, path, metadata=None):
         'base_channels': classifier.base_channels,
         'emb_dim':       classifier.emb_dim,
         'channel_mult':  classifier.channel_mult,
+        'num_res_blocks': classifier.num_res_blocks,
+        'num_tokens':    classifier.num_tokens,
     }
     if classifier.obs_shape is not None:
         config['obs_shape'] = list(classifier.obs_shape)
         config['img_resolution'] = classifier.measurement_encoder.img_resolution
+        config['enc_spatial_size'] = classifier.measurement_encoder.enc_spatial_size
     if classifier.meas_flat_dim is not None:
         config['meas_flat_dim'] = classifier.meas_flat_dim
         config['decoder_hidden'] = classifier.decoder_hidden
@@ -512,6 +636,25 @@ def load_classifier(path, device='cuda'):
     if 'meas_enc_in_dim' in checkpoint and classifier.measurement_encoder is not None:
         classifier.measurement_encoder._build(
             checkpoint['meas_enc_in_dim'], device)
-    classifier.load_state_dict(checkpoint['state_dict'])
+
+    state_dict = checkpoint['state_dict']
+
+    # Backwards compat: old checkpoints stored enc_blocks/dec_blocks as flat
+    # ModuleList (enc_blocks.0.norm1), new code nests per-level ModuleLists
+    # (enc_blocks.0.0.norm1). Remap if needed.
+    if 'num_res_blocks' not in config:
+        import re
+        remapped = {}
+        for k, v in state_dict.items():
+            # enc_blocks.N.xxx -> enc_blocks.N.0.xxx
+            m = re.match(r'^(enc_blocks|dec_blocks)\.(\d+)\.(.+)$', k)
+            if m and not re.match(r'^\d+\.', m.group(3)):
+                new_k = f'{m.group(1)}.{m.group(2)}.0.{m.group(3)}'
+                remapped[new_k] = v
+            else:
+                remapped[k] = v
+        state_dict = remapped
+
+    classifier.load_state_dict(state_dict)
     classifier.eval()
     return classifier
