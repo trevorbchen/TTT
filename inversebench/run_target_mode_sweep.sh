@@ -1,37 +1,35 @@
 #!/bin/bash
-# Tweedie vs Direct target mode sweep for CBG — 2-GPU parallel.
+# CBG HP sweep — tweedie mode, Min-SNR weighting, single GPU.
 #
-# Runs tweedie on GPU_A and direct on GPU_B simultaneously, syncing
-# at phase boundaries where cross-mode data is needed.
+# Sweeps over: lr × snr_gamma × normalize_target × num_passes
+# All configs use tweedie target (x̂₀ = E[x₀|x_t], residual = A(x̂₀) - y).
 #
 # Pipeline:
 #   Phase 0:  Setup (copy files, venv, download checkpoint)
-#   Phase 1:  HP sweep — tweedie(GPU_A) || direct(GPU_B), 3 LRs each
-#   Phase 1b: Select best LR per mode (sequential, fast)
-#   Phase 2:  Full training — tweedie(GPU_A) || direct(GPU_B)
-#   Phase 3:  Guidance tuning — tweedie(GPU_A) || direct(GPU_B)
-#   Phase 4:  Final eval — tweedie+DPS+Plain(GPU_A) || direct CBG-only(GPU_B)
+#   Phase 1:  HP sweep — 36 configs sequential
+#   Phase 1b: Select best config
+#   Phase 2:  Full training (80% data)
+#   Phase 3:  Guidance tuning
+#   Phase 4:  Final eval (CBG + DPS + Plain)
 #   Phase 5:  Summary table
 #
 # Usage:
 #   cd ~/projects/ttt/TTT && git pull
-#   nohup bash inversebench/run_target_mode_sweep.sh 0 1 > target_sweep.log 2>&1 &
+#   nohup bash inversebench/run_target_mode_sweep.sh 0 > snr_sweep.log 2>&1 &
 
 set -e
 
-GPU_A=${1:-0}
-GPU_B=${2:-1}
+GPU=${1:-0}
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 TTT_DIR="$(dirname "$SCRIPT_DIR")"
 IB_DIR="$TTT_DIR/../InverseBench"
 
-LOG_DIR="$IB_DIR/logs/target_sweep_$(date +%Y%m%d_%H%M%S)"
+LOG_DIR="$IB_DIR/logs/snr_sweep_$(date +%Y%m%d_%H%M%S)"
 mkdir -p "$LOG_DIR"
 
-echo "=== Tweedie vs Direct Target Mode Sweep ==="
-echo "  GPU_A (tweedie): $GPU_A"
-echo "  GPU_B (direct):  $GPU_B"
+echo "=== CBG HP Sweep (tweedie + Min-SNR) ==="
+echo "  GPU: $GPU"
 echo "  TTT repo:        $TTT_DIR"
 echo "  InverseBench dir: $IB_DIR"
 echo "  Logs:            $LOG_DIR"
@@ -81,349 +79,224 @@ mkdir -p checkpoints
 
 [ ! -d "../data/inv-scatter-train" ] && echo "ERROR: No training data" && exit 1
 
-echo ">>> Checking GPUs..."
-CUDA_VISIBLE_DEVICES=$GPU_A python -c "import torch; print(f'GPU_A ($GPU_A): {torch.cuda.get_device_name(0)}')"
-CUDA_VISIBLE_DEVICES=$GPU_B python -c "import torch; print(f'GPU_B ($GPU_B): {torch.cuda.get_device_name(0)}')"
+echo ">>> Checking GPU..."
+CUDA_VISIBLE_DEVICES=$GPU python -c "import torch; print(f'GPU ($GPU): {torch.cuda.get_device_name(0)}')"
 
 # =========================================================================
-# Phase 1: HP Sweep — parallel across GPUs
+# Phase 1: HP Sweep — sequential on single GPU
 # =========================================================================
 echo ""
 echo "=========================================="
-echo "Phase 1: HP Sweep (parallel)"
-echo "  tweedie x 3 LRs on GPU $GPU_A"
-echo "  direct  x 3 LRs on GPU $GPU_B"
-echo "  10% data, 10 epochs, warmup=2"
+echo "Phase 1: HP Sweep (sequential on GPU $GPU)"
+echo "  lr:               1e-4, 3e-4, 1e-3"
+echo "  snr_gamma:        0, 1, 5"
+echo "  normalize_target: true, false"
+echo "  num_passes:       1, 2"
+echo "  = 36 configs, 10% data, tweedie mode"
 echo "=========================================="
 
-SWEEP_DIR="exps/cbg_target_sweep"
+SWEEP_DIR="exps/cbg_snr_sweep"
 TRAIN_PCT=10
+CFG_IDX=0
 
-# --- Tweedie sweep on GPU_A (background) ---
-(
-    for lr in 1e-4 3e-4 1e-3; do
-        echo "[GPU_A] Sweep: tweedie lr=$lr"
-        CUDA_VISIBLE_DEVICES=$GPU_A python train_cbg.py \
+for lr in 1e-4 3e-4 1e-3; do
+  for snrg in 0 1 5; do
+    for norm in true false; do
+      for passes in 1 2; do
+        CFG_IDX=$((CFG_IDX + 1))
+        echo "[${CFG_IDX}/36] lr=$lr snrg=$snrg norm=$norm passes=$passes"
+        CUDA_VISIBLE_DEVICES=$GPU python train_cbg.py \
             problem=inv-scatter pretrain=inv-scatter \
             +cbg.target_mode=tweedie \
             +cbg.lr=$lr \
+            +cbg.snr_gamma=$snrg \
+            +cbg.normalize_target=$norm \
+            +cbg.num_passes=$passes \
             +cbg.base_channels=64 \
             +cbg.num_res_blocks=2 \
             +cbg.num_tokens=64 \
             +cbg.decoder_hidden=2048 \
             +cbg.train_pct=$TRAIN_PCT \
-            +cbg.num_epochs=10 \
-            +cbg.warmup_epochs=2 \
-            +cbg.batch_size=8 \
+            +cbg.num_sigma_steps=200 \
+            +cbg.sigma_batch_size=8 \
+            +cbg.val_every_steps=300 \
+            +cbg.save_every_steps=5000 \
             +cbg.val_fraction=0.1 \
-            +cbg.sequential_sigma=false \
             +cbg.grad_clip=10.0 \
             +cbg.save_dir=$SWEEP_DIR \
-            || echo "  FAILED: tweedie lr=$lr"
+            >> "$LOG_DIR/sweep.log" 2>&1 \
+            || echo "  FAILED: lr=$lr snrg=$snrg norm=$norm passes=$passes"
+      done
     done
-) > "$LOG_DIR/sweep_tweedie.log" 2>&1 &
-PID_TWEEDIE_SWEEP=$!
+  done
+done
 
-# --- Direct sweep on GPU_B (background) ---
-(
-    for lr in 1e-4 3e-4 1e-3; do
-        echo "[GPU_B] Sweep: direct lr=$lr"
-        CUDA_VISIBLE_DEVICES=$GPU_B python train_cbg.py \
-            problem=inv-scatter pretrain=inv-scatter \
-            +cbg.target_mode=direct \
-            +cbg.lr=$lr \
-            +cbg.base_channels=64 \
-            +cbg.num_res_blocks=2 \
-            +cbg.num_tokens=64 \
-            +cbg.decoder_hidden=2048 \
-            +cbg.train_pct=$TRAIN_PCT \
-            +cbg.num_epochs=10 \
-            +cbg.warmup_epochs=2 \
-            +cbg.batch_size=8 \
-            +cbg.val_fraction=0.1 \
-            +cbg.sequential_sigma=false \
-            +cbg.grad_clip=10.0 \
-            +cbg.save_dir=$SWEEP_DIR \
-            || echo "  FAILED: direct lr=$lr"
-    done
-) > "$LOG_DIR/sweep_direct.log" 2>&1 &
-PID_DIRECT_SWEEP=$!
-
-echo "  Tweedie sweep PID: $PID_TWEEDIE_SWEEP"
-echo "  Direct  sweep PID: $PID_DIRECT_SWEEP"
-echo "  Waiting for both..."
-
-wait $PID_TWEEDIE_SWEEP
-TWEEDIE_SWEEP_RC=$?
-wait $PID_DIRECT_SWEEP
-DIRECT_SWEEP_RC=$?
-
-echo "  Tweedie sweep exit: $TWEEDIE_SWEEP_RC"
-echo "  Direct  sweep exit: $DIRECT_SWEEP_RC"
-
-if [ $TWEEDIE_SWEEP_RC -ne 0 ] || [ $DIRECT_SWEEP_RC -ne 0 ]; then
-    echo "WARNING: One or more sweep jobs failed. Check logs:"
-    echo "  $LOG_DIR/sweep_tweedie.log"
-    echo "  $LOG_DIR/sweep_direct.log"
-fi
+echo "  Sweep done ($CFG_IDX configs)."
 
 # =========================================================================
-# Phase 1b: Select best LR per target mode
+# Phase 1b: Select best config
 # =========================================================================
 echo ""
 echo "=========================================="
-echo "Phase 1b: Selecting best LR per mode"
+echo "Phase 1b: Selecting best config"
 echo "=========================================="
 
-read BEST_LR_TWEEDIE BEST_LOSS_TWEEDIE BEST_DIR_TWEEDIE <<< $(python -c "
-import json, glob, os
-best_loss, best_lr, best_dir = float('inf'), '', ''
+read BEST_LR BEST_SNRG BEST_NORM BEST_PASSES BEST_LOSS BEST_DIR <<< $(python -c "
+import json, glob, os, re
+
+best_loss = float('inf')
+best_lr, best_snrg, best_norm, best_passes, best_dir = '', '', '', '', ''
+
+print('  All sweep results:')
 for p in sorted(glob.glob('$SWEEP_DIR/*/progress.json')):
     try:
         d = os.path.dirname(p)
         name = os.path.basename(d)
-        if '_tweedie_' not in name:
-            continue
         state = json.load(open(p))
         vl = state.get('best_val_loss') or state.get('val_loss')
         if vl is None:
             continue
+
+        # Parse HPs from directory name
         lr_str = name.split('_lr')[1].split('_ch')[0]
+
+        m = re.search(r'_snrg([\d.]+)', name)
+        snrg_str = m.group(1) if m else '0'
+        if '_nosnr' in name:
+            snrg_str = '0'
+
+        # normalize_target: encoded in config.yaml
+        cfg_path = os.path.join(d, 'config.yaml')
+        norm_str = 'true'
+        passes_str = '1'
+        if os.path.exists(cfg_path):
+            import yaml
+            cfg = yaml.safe_load(open(cfg_path))
+            cbg = cfg.get('cbg', {})
+            norm_str = str(cbg.get('normalize_target', True)).lower()
+            passes_str = str(cbg.get('num_passes', 1))
+
+        marker = ' <-- BEST' if vl < best_loss else ''
+        print(f'    lr={lr_str} snrg={snrg_str} norm={norm_str} passes={passes_str} -> val_loss={vl:.6f}{marker}')
+
         if vl < best_loss:
-            best_loss, best_lr, best_dir = vl, lr_str, d
+            best_loss = vl
+            best_lr, best_snrg, best_norm, best_passes, best_dir = lr_str, snrg_str, norm_str, passes_str, d
     except Exception as e:
-        print(f'  skip {p}: {e}', flush=True)
-print(f'{best_lr} {best_loss} {best_dir}')
+        print(f'    skip {p}: {e}')
+
+print(f'{best_lr} {best_snrg} {best_norm} {best_passes} {best_loss} {best_dir}')
 ")
 
-read BEST_LR_DIRECT BEST_LOSS_DIRECT BEST_DIR_DIRECT <<< $(python -c "
-import json, glob, os
-best_loss, best_lr, best_dir = float('inf'), '', ''
-for p in sorted(glob.glob('$SWEEP_DIR/*/progress.json')):
-    try:
-        d = os.path.dirname(p)
-        name = os.path.basename(d)
-        if '_direct_' not in name:
-            continue
-        state = json.load(open(p))
-        vl = state.get('best_val_loss') or state.get('val_loss')
-        if vl is None:
-            continue
-        lr_str = name.split('_lr')[1].split('_ch')[0]
-        if vl < best_loss:
-            best_loss, best_lr, best_dir = vl, lr_str, d
-    except Exception as e:
-        print(f'  skip {p}: {e}', flush=True)
-print(f'{best_lr} {best_loss} {best_dir}')
-")
+echo ""
+echo "  Best config:"
+echo "    lr=$BEST_LR"
+echo "    snr_gamma=$BEST_SNRG"
+echo "    normalize_target=$BEST_NORM"
+echo "    num_passes=$BEST_PASSES"
+echo "    val_loss=$BEST_LOSS"
+echo "    dir=$BEST_DIR"
 
-echo "  Tweedie best: lr=$BEST_LR_TWEEDIE, val_loss=$BEST_LOSS_TWEEDIE"
-echo "  Direct  best: lr=$BEST_LR_DIRECT,  val_loss=$BEST_LOSS_DIRECT"
-
-if [ -z "$BEST_LR_TWEEDIE" ] || [ "$BEST_LR_TWEEDIE" = "inf" ]; then
-    echo "ERROR: No valid tweedie sweep results!"
-    echo "Check: $LOG_DIR/sweep_tweedie.log"
-    exit 1
-fi
-if [ -z "$BEST_LR_DIRECT" ] || [ "$BEST_LR_DIRECT" = "inf" ]; then
-    echo "ERROR: No valid direct sweep results!"
-    echo "Check: $LOG_DIR/sweep_direct.log"
+if [ -z "$BEST_LR" ] || [ "$BEST_LR" = "inf" ]; then
+    echo "ERROR: No valid sweep results!"
+    echo "Check: $LOG_DIR/sweep.log"
     exit 1
 fi
 
 # =========================================================================
-# Phase 2: Full Training — parallel across GPUs
+# Phase 2: Full Training (80% data)
 # =========================================================================
 echo ""
 echo "=========================================="
-echo "Phase 2: Full training (parallel, 80% data, 50 epochs)"
-echo "  Tweedie lr=$BEST_LR_TWEEDIE on GPU $GPU_A"
-echo "  Direct  lr=$BEST_LR_DIRECT  on GPU $GPU_B"
+echo "Phase 2: Full training (80% data)"
+echo "  lr=$BEST_LR snr_gamma=$BEST_SNRG norm=$BEST_NORM passes=$BEST_PASSES"
+echo "  on GPU $GPU"
 echo "=========================================="
 
-FULL_DIR="exps/cbg_target_full"
+FULL_DIR="exps/cbg_snr_full"
 
-# --- Tweedie full train on GPU_A ---
-(
-    echo "[GPU_A] Full train: tweedie lr=$BEST_LR_TWEEDIE"
-    CUDA_VISIBLE_DEVICES=$GPU_A python train_cbg.py \
-        problem=inv-scatter pretrain=inv-scatter \
-        +cbg.target_mode=tweedie \
-        +cbg.lr=$BEST_LR_TWEEDIE \
-        +cbg.base_channels=64 \
-        +cbg.num_res_blocks=2 \
-        +cbg.num_tokens=64 \
-        +cbg.decoder_hidden=2048 \
-        +cbg.train_pct=80 \
-        +cbg.num_epochs=50 \
-        +cbg.warmup_epochs=5 \
-        +cbg.batch_size=8 \
-        +cbg.val_fraction=0.1 \
-        +cbg.sequential_sigma=false \
-        +cbg.grad_clip=10.0 \
-        +cbg.save_dir=$FULL_DIR
-) > "$LOG_DIR/full_tweedie.log" 2>&1 &
-PID_TWEEDIE_FULL=$!
+CUDA_VISIBLE_DEVICES=$GPU python train_cbg.py \
+    problem=inv-scatter pretrain=inv-scatter \
+    +cbg.target_mode=tweedie \
+    +cbg.lr=$BEST_LR \
+    +cbg.snr_gamma=$BEST_SNRG \
+    +cbg.normalize_target=$BEST_NORM \
+    +cbg.num_passes=$BEST_PASSES \
+    +cbg.base_channels=64 \
+    +cbg.num_res_blocks=2 \
+    +cbg.num_tokens=64 \
+    +cbg.decoder_hidden=2048 \
+    +cbg.train_pct=80 \
+    +cbg.num_sigma_steps=200 \
+    +cbg.sigma_batch_size=8 \
+    +cbg.val_every_steps=1000 \
+    +cbg.save_every_steps=4000 \
+    +cbg.val_fraction=0.1 \
+    +cbg.grad_clip=10.0 \
+    +cbg.save_dir=$FULL_DIR \
+    > "$LOG_DIR/full_train.log" 2>&1
 
-# --- Direct full train on GPU_B ---
-(
-    echo "[GPU_B] Full train: direct lr=$BEST_LR_DIRECT"
-    CUDA_VISIBLE_DEVICES=$GPU_B python train_cbg.py \
-        problem=inv-scatter pretrain=inv-scatter \
-        +cbg.target_mode=direct \
-        +cbg.lr=$BEST_LR_DIRECT \
-        +cbg.base_channels=64 \
-        +cbg.num_res_blocks=2 \
-        +cbg.num_tokens=64 \
-        +cbg.decoder_hidden=2048 \
-        +cbg.train_pct=80 \
-        +cbg.num_epochs=50 \
-        +cbg.warmup_epochs=5 \
-        +cbg.batch_size=8 \
-        +cbg.val_fraction=0.1 \
-        +cbg.sequential_sigma=false \
-        +cbg.grad_clip=10.0 \
-        +cbg.save_dir=$FULL_DIR
-) > "$LOG_DIR/full_direct.log" 2>&1 &
-PID_DIRECT_FULL=$!
-
-echo "  Tweedie full PID: $PID_TWEEDIE_FULL"
-echo "  Direct  full PID: $PID_DIRECT_FULL"
-echo "  Waiting for both..."
-
-wait $PID_TWEEDIE_FULL
-wait $PID_DIRECT_FULL
 echo "  Full training done."
 
 # =========================================================================
-# Phase 3: Guidance scale tuning — parallel across GPUs
+# Phase 3: Guidance scale tuning
 # =========================================================================
 echo ""
 echo "=========================================="
-echo "Phase 3: Guidance tuning (parallel)"
+echo "Phase 3: Guidance tuning"
 echo "=========================================="
 
-TUNE_DIR="exps/cbg_target_tune"
+TUNE_DIR="exps/cbg_snr_tune"
 
-CLASSIFIER_TWEEDIE=$(find $FULL_DIR -path "*_tweedie_*" -name "classifier_best.pt" | head -1)
-CLASSIFIER_DIRECT=$(find $FULL_DIR -path "*_direct_*" -name "classifier_best.pt" | head -1)
-
-if [ -z "$CLASSIFIER_TWEEDIE" ]; then
-    echo "ERROR: No classifier_best.pt for tweedie in $FULL_DIR"
+CLASSIFIER=$(find $FULL_DIR -name "classifier_best.pt" | head -1)
+if [ -z "$CLASSIFIER" ]; then
+    echo "ERROR: No classifier_best.pt found in $FULL_DIR"
     exit 1
 fi
-if [ -z "$CLASSIFIER_DIRECT" ]; then
-    echo "ERROR: No classifier_best.pt for direct in $FULL_DIR"
-    exit 1
-fi
+echo "  Classifier: $CLASSIFIER"
 
-echo "  Tweedie classifier: $CLASSIFIER_TWEEDIE"
-echo "  Direct  classifier: $CLASSIFIER_DIRECT"
+CUDA_VISIBLE_DEVICES=$GPU python tune_guidance.py \
+    problem=inv-scatter pretrain=inv-scatter \
+    +eval.classifier_path=$CLASSIFIER \
+    +eval.num_test=20 \
+    +eval.num_steps=200 \
+    +eval.run_dps=False \
+    "+eval.scales=\"0.5,1.0,2.0,5.0,10.0,20.0\"" \
+    +eval.out_dir=$TUNE_DIR \
+    > "$LOG_DIR/tune.log" 2>&1
 
-# --- Tweedie tune on GPU_A ---
-(
-    echo "[GPU_A] Guidance tuning: tweedie"
-    CUDA_VISIBLE_DEVICES=$GPU_A python tune_guidance.py \
-        problem=inv-scatter pretrain=inv-scatter \
-        +eval.classifier_path=$CLASSIFIER_TWEEDIE \
-        +eval.num_test=20 \
-        +eval.num_steps=200 \
-        +eval.run_dps=False \
-        "+eval.scales=\"0.5,1.0,1.5,2.0,3.0,5.0\"" \
-        +eval.out_dir=$TUNE_DIR/tweedie
-) > "$LOG_DIR/tune_tweedie.log" 2>&1 &
-PID_TUNE_TW=$!
-
-# --- Direct tune on GPU_B ---
-(
-    echo "[GPU_B] Guidance tuning: direct"
-    CUDA_VISIBLE_DEVICES=$GPU_B python tune_guidance.py \
-        problem=inv-scatter pretrain=inv-scatter \
-        +eval.classifier_path=$CLASSIFIER_DIRECT \
-        +eval.num_test=20 \
-        +eval.num_steps=200 \
-        +eval.run_dps=False \
-        "+eval.scales=\"0.5,1.0,1.5,2.0,3.0,5.0\"" \
-        +eval.out_dir=$TUNE_DIR/direct
-) > "$LOG_DIR/tune_direct.log" 2>&1 &
-PID_TUNE_DR=$!
-
-echo "  Tweedie tune PID: $PID_TUNE_TW"
-echo "  Direct  tune PID: $PID_TUNE_DR"
-echo "  Waiting for both..."
-
-wait $PID_TUNE_TW
-wait $PID_TUNE_DR
-echo "  Guidance tuning done."
-
-# Extract best scales
-BEST_SCALE_TWEEDIE=$(python -c "
+BEST_SCALE=$(python -c "
 import json
-d = json.load(open('$TUNE_DIR/tweedie/guidance_sweep.json'))
+d = json.load(open('$TUNE_DIR/guidance_sweep.json'))
 print(d['best_scale'])
 ")
-BEST_SCALE_DIRECT=$(python -c "
-import json
-d = json.load(open('$TUNE_DIR/direct/guidance_sweep.json'))
-print(d['best_scale'])
-")
-
-echo "  Tweedie best scale: $BEST_SCALE_TWEEDIE"
-echo "  Direct  best scale: $BEST_SCALE_DIRECT"
+echo "  Best guidance scale: $BEST_SCALE"
 
 # =========================================================================
-# Phase 4: Final Eval — parallel across GPUs
+# Phase 4: Final Eval (CBG + DPS + Plain)
 # =========================================================================
 echo ""
 echo "=========================================="
-echo "Phase 4: Final evaluation (parallel, 100 test samples)"
-echo "  Tweedie (CBG+DPS+Plain) on GPU $GPU_A"
-echo "  Direct  (CBG only)      on GPU $GPU_B"
+echo "Phase 4: Final evaluation (100 test samples)"
+echo "  CBG + DPS + Plain on GPU $GPU"
 echo "=========================================="
 
-EVAL_DIR="exps/cbg_target_eval"
+EVAL_DIR="exps/cbg_snr_eval"
 
-# --- Tweedie eval on GPU_A: CBG + DPS + Plain, save images ---
-(
-    echo "[GPU_A] Eval: tweedie (CBG + DPS + Plain)"
-    CUDA_VISIBLE_DEVICES=$GPU_A python eval_cbg.py \
-        problem=inv-scatter pretrain=inv-scatter \
-        +eval.classifier_path=$CLASSIFIER_TWEEDIE \
-        +eval.guidance_scale=$BEST_SCALE_TWEEDIE \
-        +eval.num_steps=200 \
-        +eval.num_test=100 \
-        +eval.run_dps=True \
-        +eval.dps_guidance_scale=1.0 \
-        +eval.run_plain=True \
-        +eval.save_images=True \
-        +eval.num_vis=8 \
-        +eval.out_dir=$EVAL_DIR/tweedie
-) > "$LOG_DIR/eval_tweedie.log" 2>&1 &
-PID_EVAL_TW=$!
+CUDA_VISIBLE_DEVICES=$GPU python eval_cbg.py \
+    problem=inv-scatter pretrain=inv-scatter \
+    +eval.classifier_path=$CLASSIFIER \
+    +eval.guidance_scale=$BEST_SCALE \
+    +eval.num_steps=200 \
+    +eval.num_test=100 \
+    +eval.run_dps=True \
+    +eval.dps_guidance_scale=1.0 \
+    +eval.run_plain=True \
+    +eval.save_images=True \
+    +eval.num_vis=8 \
+    +eval.out_dir=$EVAL_DIR \
+    > "$LOG_DIR/eval.log" 2>&1
 
-# --- Direct eval on GPU_B: CBG only, save images ---
-(
-    echo "[GPU_B] Eval: direct (CBG only)"
-    CUDA_VISIBLE_DEVICES=$GPU_B python eval_cbg.py \
-        problem=inv-scatter pretrain=inv-scatter \
-        +eval.classifier_path=$CLASSIFIER_DIRECT \
-        +eval.guidance_scale=$BEST_SCALE_DIRECT \
-        +eval.num_steps=200 \
-        +eval.num_test=100 \
-        +eval.run_dps=False \
-        +eval.run_plain=False \
-        +eval.save_images=True \
-        +eval.num_vis=8 \
-        +eval.out_dir=$EVAL_DIR/direct
-) > "$LOG_DIR/eval_direct.log" 2>&1 &
-PID_EVAL_DR=$!
-
-echo "  Tweedie eval PID: $PID_EVAL_TW"
-echo "  Direct  eval PID: $PID_EVAL_DR"
-echo "  Waiting for both..."
-
-wait $PID_EVAL_TW
-wait $PID_EVAL_DR
 echo "  Evaluation done."
 
 # =========================================================================
@@ -431,7 +304,7 @@ echo "  Evaluation done."
 # =========================================================================
 echo ""
 echo "=========================================="
-echo "Phase 5: Combined Summary"
+echo "Phase 5: Summary"
 echo "=========================================="
 
 python -c "
@@ -449,45 +322,38 @@ def ci95(vals):
     hw = stats.t.ppf(0.975, df=n-1) * s / np.sqrt(n)
     return m, hw, s
 
+ev = json.load(open('$EVAL_DIR/eval_results.json'))
 rows = []
 
-# Tweedie CBG
-tw = json.load(open('$EVAL_DIR/tweedie/eval_results.json'))
-m, hw, s = ci95(tw['cbg']['per_sample'])
-rows.append(('CBG-tweedie', m, hw, s, tw['cbg']['time_per_sample_sec']))
+# CBG
+m, hw, s = ci95(ev['cbg']['per_sample'])
+rows.append(('CBG', m, hw, s, ev['cbg']['time_per_sample_sec']))
 
-# Direct CBG
-dr = json.load(open('$EVAL_DIR/direct/eval_results.json'))
-m, hw, s = ci95(dr['cbg']['per_sample'])
-rows.append(('CBG-direct', m, hw, s, dr['cbg']['time_per_sample_sec']))
+# DPS
+if 'dps' in ev:
+    m, hw, s = ci95(ev['dps']['per_sample'])
+    rows.append(('DPS', m, hw, s, ev['dps']['time_per_sample_sec']))
 
-# DPS (from tweedie eval)
-if 'dps' in tw:
-    m, hw, s = ci95(tw['dps']['per_sample'])
-    rows.append(('DPS', m, hw, s, tw['dps']['time_per_sample_sec']))
-
-# Plain (from tweedie eval)
-if 'plain' in tw:
-    m, hw, s = ci95(tw['plain']['per_sample'])
-    rows.append(('Plain', m, hw, s, tw['plain']['time_per_sample_sec']))
+# Plain
+if 'plain' in ev:
+    m, hw, s = ci95(ev['plain']['per_sample'])
+    rows.append(('Plain', m, hw, s, ev['plain']['time_per_sample_sec']))
 
 print()
-print(f\"{'Method':<16} {'Mean L2':>12} {'95% CI':>20} {'Time/sample':>14}\")
-print(f\"{'-'*64}\")
+print(f'Best sweep config: lr=$BEST_LR, snr_gamma=$BEST_SNRG, normalize=$BEST_NORM, passes=$BEST_PASSES')
+print(f'Guidance scale: $BEST_SCALE')
+print()
+print(f\"{'Method':<10} {'Mean L2':>10} {'95% CI':>20} {'Std':>8} {'Time/samp':>12}\")
+print(f\"{'-'*62}\")
 for name, mean, ci, std, tps in rows:
     ci_str = f'[{mean-ci:.4f}, {mean+ci:.4f}]'
-    print(f'{name:<16} {mean:>12.6f} {ci_str:>20} {tps:>12.2f}s')
+    print(f'{name:<10} {mean:>10.6f} {ci_str:>20} {std:>8.4f} {tps:>10.2f}s')
 print()
-
-# Highlight best CBG
-cbg_rows = [r for r in rows if r[0].startswith('CBG')]
-best = min(cbg_rows, key=lambda r: r[1])
-print(f'Best CBG method: {best[0]} (mean L2={best[1]:.6f})')
 "
 
 echo ""
 echo "=========================================="
-echo "=== Target mode sweep complete! ==="
+echo "=== SNR sweep complete! ==="
 echo "=========================================="
 echo "  Sweep:      $SWEEP_DIR/"
 echo "  Full train: $FULL_DIR/"

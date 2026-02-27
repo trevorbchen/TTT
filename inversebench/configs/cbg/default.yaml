@@ -13,24 +13,28 @@ num_tokens: 0         # cross-attention tokens (0 = off, 64 = recommended)
 # Training
 lr: 1e-4
 weight_decay: 1e-4
-batch_size: 8
-num_epochs: 50
 grad_clip: 10.0
-warmup_epochs: 5  # linear LR warmup before cosine decay
+
+# Sequential sigma training (TTT-style):
+#   For each sample, iterate through ALL sigma levels (single pass).
+num_sigma_steps: 200    # number of discrete VP sigma levels
+sigma_batch_size: 8     # sigma levels batched per optimizer step
+num_passes: 1           # passes through the dataset
+val_every_steps: 500    # validate every N optimizer steps
+save_every_steps: 2000  # checkpoint every N steps
+
+# Min-SNR-gamma loss weighting (Kingma/Hang et al.)
+#   Upweights low-noise (fine detail) steps, downweights high-noise (coarse).
+#   w(sigma) = min(1/sigma^2, gamma). Set 0 to disable.
+snr_gamma: 5.0
 
 # Data
 train_pct: 10
 val_fraction: 0.1
 
-# Sequential sigma training (TTT-style)
-# When true, iterates ALL sigma levels per sample instead of random sampling
-sequential_sigma: false
-num_sigma_steps: 200    # number of discrete VP sigma levels
-sigma_batch_size: 8     # sigma levels batched per optimizer step
-num_passes: 1           # passes through the dataset
-val_every_steps: 500    # validate every N optimizer steps (sequential mode)
-save_every_steps: 2000  # checkpoint every N steps (sequential mode)
+# Target
+target_mode: tweedie    # "tweedie" or "direct"
+normalize_target: true
 
-# Checkpointing
-save_every: 10
+# Output
 save_dir: exps/cbg

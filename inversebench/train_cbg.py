@@ -16,7 +16,7 @@ Outputs: classifier_best.pt, classifier_final.pt, progress.json,
 Usage:
     python train_cbg.py \
         problem=inv-scatter pretrain=inv-scatter \
-        +cbg.train_pct=10 +cbg.lr=1e-4 +cbg.num_epochs=50
+        +cbg.train_pct=10 +cbg.lr=1e-4 +cbg.num_sigma_steps=200
 """
 
 import json
@@ -64,8 +64,9 @@ class Logger:
         self.state = {
             "status": "initializing",
             "start_time": datetime.now().isoformat(),
-            "epoch": 0,
-            "total_epochs": 0,
+            "pass": 0,
+            "step": 0,
+            "total_steps": 0,
             "train_loss": None,
             "val_loss": None,
             "best_val_loss": None,
@@ -295,50 +296,47 @@ def main(config: DictConfig):
     lr            = cbg.get("lr", 1e-4)
     weight_decay  = cbg.get("weight_decay", 1e-4)
     batch_size    = cbg.get("batch_size", 8)
-    num_epochs    = cbg.get("num_epochs", 50)
     grad_clip     = cbg.get("grad_clip", 10.0)
     train_pct     = cbg.get("train_pct", 10)
     val_fraction  = cbg.get("val_fraction", 0.1)
-    save_every    = cbg.get("save_every", 10)
     save_dir      = cbg.get("save_dir", "exps/cbg")
     target_mode   = cbg.get("target_mode", "tweedie")  # "tweedie" or "direct"
     normalize_target = cbg.get("normalize_target", True)
     decoder_hidden = cbg.get("decoder_hidden", 2048)
     num_res_blocks = cbg.get("num_res_blocks", 1)
     num_tokens     = cbg.get("num_tokens", 0)
-    warmup_epochs  = cbg.get("warmup_epochs", 5)
-    # Sequential sigma training (TTT-style)
-    sequential_sigma = cbg.get("sequential_sigma", False)
+    # Sequential sigma training (TTT-style): single pass, all sigmas per sample
     num_sigma_steps  = cbg.get("num_sigma_steps", 200)
     sigma_batch_size = cbg.get("sigma_batch_size", 8)
     num_passes       = cbg.get("num_passes", 1)
     val_every_steps  = cbg.get("val_every_steps", 500)
     save_every_steps = cbg.get("save_every_steps", 2000)
+    snr_gamma        = cbg.get("snr_gamma", 5.0)  # Min-SNR-γ weighting (0=off)
     assert target_mode in ("tweedie", "direct"), \
         f"Unknown target_mode={target_mode!r}, expected 'tweedie' or 'direct'"
 
     # --- Output directory ---
     problem_name = config.problem.get("name", "unknown")
-    tag = "seq" if sequential_sigma else "cbg"
-    root = Path(save_dir) / f"{problem_name}_{tag}_{target_mode}_{train_pct}pct_lr{lr}_ch{base_channels}"
+    snr_tag = f"_snrg{snr_gamma}" if snr_gamma > 0 else "_nosnr"
+    norm_tag = "_norm" if normalize_target else "_nonorm"
+    pass_tag = f"_p{num_passes}" if num_passes > 1 else ""
+    root = Path(save_dir) / f"{problem_name}_cbg_{target_mode}_{train_pct}pct_lr{lr}_ch{base_channels}{snr_tag}{norm_tag}{pass_tag}"
     root.mkdir(parents=True, exist_ok=True)
 
     # --- Logger ---
     logger = Logger(root)
-    logger.log(f"CBG Training for InverseBench")
-    if sequential_sigma:
-        logger.log(f"  MODE: sequential_sigma (TTT-style)")
-        logger.log(f"  num_sigma_steps={num_sigma_steps}, "
-                   f"sigma_batch_size={sigma_batch_size}, "
-                   f"num_passes={num_passes}")
+    logger.log(f"CBG Training for InverseBench (sequential sigma, TTT-style)")
+    logger.log(f"  num_sigma_steps={num_sigma_steps}, "
+               f"sigma_batch_size={sigma_batch_size}, "
+               f"num_passes={num_passes}")
     logger.log(f"  target_mode={target_mode}, normalize_target={normalize_target}, "
                f"base_channels={base_channels}, decoder_hidden={decoder_hidden}, "
                f"num_res_blocks={num_res_blocks}, num_tokens={num_tokens}, "
-               f"lr={lr}, epochs={num_epochs}, train_pct={train_pct}, "
-               f"warmup={warmup_epochs}")
+               f"lr={lr}, train_pct={train_pct}")
+    logger.log(f"  snr_gamma={snr_gamma} ({'enabled' if snr_gamma > 0 else 'disabled'})")
     logger.log(f"  output: {root}")
     logger.log(f"  device: {device}")
-    logger.update_progress(status="loading", total_epochs=num_epochs)
+    logger.update_progress(status="loading")
 
     # Save config
     with open(str(root / "config.yaml"), "w") as f:
@@ -464,252 +462,84 @@ def main(config: DictConfig):
     best_val_loss = float('inf')
     logger.update_progress(status="training")
 
-    if sequential_sigma:
-        # =============================================================
-        # Sequential sigma training (TTT-style):
-        #   For each sample, iterate through ALL sigma levels.
-        #   Sigma levels are batched (sigma_batch_size) for efficiency.
-        # =============================================================
-        sigma_levels = get_vp_sigma_steps(num_sigma_steps).to(device)
-        n_sigmas = len(sigma_levels)
-        steps_per_sample = math.ceil(n_sigmas / sigma_batch_size)
-        total_steps = n_train * num_passes * steps_per_sample
+    # =================================================================
+    # Sequential sigma training (TTT-style):
+    #   For each sample, iterate through ALL sigma levels.
+    #   Sigma levels are batched (sigma_batch_size) for efficiency.
+    #   Single pass through dataset by default.
+    # =================================================================
+    sigma_levels = get_vp_sigma_steps(num_sigma_steps).to(device)
+    n_sigmas = len(sigma_levels)
+    steps_per_sample = math.ceil(n_sigmas / sigma_batch_size)
+    total_steps = n_train * num_passes * steps_per_sample
 
-        # Step-based LR warmup + cosine decay
-        warmup_lr_steps = max(int(total_steps * 0.05), 1)
-        if warmup_lr_steps > 0 and total_steps > warmup_lr_steps:
-            warmup_sched = torch.optim.lr_scheduler.LinearLR(
-                optimizer, start_factor=0.01, total_iters=warmup_lr_steps)
-            cosine_sched = torch.optim.lr_scheduler.CosineAnnealingLR(
-                optimizer, T_max=max(total_steps - warmup_lr_steps, 1),
-                eta_min=lr * 0.01)
-            lr_scheduler = torch.optim.lr_scheduler.SequentialLR(
-                optimizer, [warmup_sched, cosine_sched],
-                milestones=[warmup_lr_steps])
-        else:
-            lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                optimizer, T_max=max(total_steps, 10), eta_min=lr * 0.01)
-
-        logger.log(f"Sequential sigma: {n_sigmas} levels, "
-                   f"sigma_batch_size={sigma_batch_size}, "
-                   f"steps/sample={steps_per_sample}, total={total_steps}")
-        logger.log(f"  sigma range: [{sigma_levels[-1]:.4f}, {sigma_levels[0]:.4f}]")
-        logger.log(f"  LR warmup: {warmup_lr_steps} steps, cosine to {total_steps}")
-        logger.update_progress(total_steps=total_steps)
-
-        global_step = 0
-        log_interval = max(total_steps // 100, 50)
-        running_loss = 0.0
-        running_rel = 0.0
-        running_count = 0
-
-        for pass_num in range(1, num_passes + 1):
-            order = np.random.permutation(n_train)
-            classifier.train()
-            t_pass = time.time()
-
-            pbar = tqdm.tqdm(range(n_train),
-                             desc=f"Pass {pass_num}/{num_passes}")
-
-            for sample_idx in pbar:
-                i = order[sample_idx]
-                x0 = images[i:i+1]
-                y_single = measurements[i:i+1]
-
-                # Iterate through all sigma levels for this sample
-                for sig_start in range(0, n_sigmas, sigma_batch_size):
-                    sig_end = min(sig_start + sigma_batch_size, n_sigmas)
-                    B = sig_end - sig_start
-                    sigma = sigma_levels[sig_start:sig_end]
-
-                    # Repeat sample for each sigma in batch
-                    x0_rep = x0.expand(B, -1, -1, -1)
-                    y_rep = y_single.expand(B, *[-1] * (y_single.ndim - 1))
-                    sigma_bc = sigma.view(-1, 1, 1, 1)
-                    eps = torch.randn(B, *x0.shape[1:], device=device)
-                    x_noisy = x0_rep + sigma_bc * eps
-
-                    with torch.no_grad():
-                        if target_mode == "tweedie":
-                            denoised = net(x_noisy, sigma)
-                            y_hat = forward_op({'target': denoised})
-                        else:  # direct
-                            y_hat = forward_op({'target': x_noisy})
-                        residual = y_hat - y_rep
-                        if classifier.measurement_decoder is not None:
-                            if residual.is_complex():
-                                target = torch.view_as_real(residual).flatten(1).float()
-                            else:
-                                target = residual.flatten(1).float()
-                        else:
-                            target = residual
-                        if normalize_target:
-                            tnorm = target.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-                            target = target / tnorm
-
-                    pred = classifier(x_noisy, sigma, y_rep)
-                    loss = (pred - target).pow(2).flatten(1).sum(-1).mean()
-
-                    optimizer.zero_grad()
-                    loss.backward()
-                    gn = torch.nn.utils.clip_grad_norm_(
-                        classifier.parameters(), grad_clip).item()
-                    grad_norms.append(gn)
-                    optimizer.step()
-                    lr_scheduler.step()
-
-                    loss_val = loss.item()
-                    step_losses.append(loss_val)
-                    with torch.no_grad():
-                        target_energy = target.pow(2).flatten(1).sum(-1).mean().item()
-                        rel_err = loss_val / max(target_energy, 1e-10)
-                    running_loss += loss_val
-                    running_rel += rel_err
-                    running_count += 1
-                    global_step += 1
-
-                    pbar.set_postfix(
-                        step=f"{global_step}/{total_steps}",
-                        loss=f"{loss_val:.4f}",
-                        rel=f"{rel_err:.3f}",
-                        lr=f"{optimizer.param_groups[0]['lr']:.2e}")
-
-                    # Periodic logging
-                    if global_step % log_interval == 0 and running_count > 0:
-                        avg_loss = running_loss / running_count
-                        avg_rel = running_rel / running_count
-                        avg_gn = np.mean(grad_norms[-running_count:])
-                        logger.log(
-                            f"Step {global_step:6d}/{total_steps} | "
-                            f"loss={avg_loss:.6f} | rel_err={avg_rel:.3f} | "
-                            f"lr={optimizer.param_groups[0]['lr']:.2e} | "
-                            f"gnorm={avg_gn:.4f}")
-                        running_loss = 0.0
-                        running_rel = 0.0
-                        running_count = 0
-
-                    # Periodic validation
-                    if (global_step % val_every_steps == 0
-                            and eval_images is not None):
-                        classifier.eval()
-                        val_loss = 0.0
-                        val_batches = 0
-                        with torch.no_grad():
-                            for v_st in range(0, n_val, batch_size):
-                                x0v = eval_images[v_st:v_st+batch_size]
-                                y_bv = eval_measurements[v_st:v_st+batch_size]
-                                Bv = x0v.shape[0]
-                                sv = sample_sigma(net, Bv, device)
-                                sv_bc = sv.view(-1, 1, 1, 1)
-                                epsv = torch.randn_like(x0v)
-                                x_nv = x0v + sv_bc * epsv
-                                if target_mode == "tweedie":
-                                    dv = net(x_nv, sv)
-                                    y_hv = forward_op({'target': dv})
-                                else:
-                                    y_hv = forward_op({'target': x_nv})
-                                rv = y_hv - y_bv
-                                if classifier.measurement_decoder is not None:
-                                    if rv.is_complex():
-                                        tv = torch.view_as_real(rv).flatten(1).float()
-                                    else:
-                                        tv = rv.flatten(1).float()
-                                else:
-                                    tv = rv
-                                if normalize_target:
-                                    tn = tv.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-                                    tv = tv / tn
-                                pv = classifier(x_nv, sv, y_bv)
-                                val_loss += (pv - tv).pow(2).flatten(1).sum(-1).mean().item()
-                                val_batches += 1
-                        avg_val = val_loss / max(val_batches, 1)
-                        epoch_val_losses.append(avg_val)
-                        avg_recent = np.mean(
-                            step_losses[max(0, len(step_losses) - val_every_steps):])
-                        epoch_train_losses.append(avg_recent)
-
-                        logger.log(f"  VAL @ step {global_step}: "
-                                   f"train_avg={avg_recent:.6f} | "
-                                   f"val={avg_val:.6f}")
-
-                        is_best = avg_val < best_val_loss
-                        if is_best:
-                            best_val_loss = avg_val
-                            save_classifier(
-                                classifier,
-                                str(root / "classifier_best.pt"),
-                                metadata={"step": global_step,
-                                          "val_loss": avg_val,
-                                          "target_mode": target_mode})
-                            logger.log(f"  -> New best val_loss={avg_val:.6f}")
-
-                        classifier.train()
-                        save_loss_curves(step_losses, epoch_train_losses,
-                                         epoch_val_losses, grad_norms, root)
-
-                    # Periodic checkpoint
-                    if global_step % save_every_steps == 0:
-                        save_classifier(
-                            classifier,
-                            str(root / f"classifier_step{global_step}.pt"),
-                            metadata={"step": global_step,
-                                      "target_mode": target_mode})
-
-                    # Progress update
-                    logger.update_progress(
-                        status="training", epoch=pass_num,
-                        step=global_step, train_loss=loss_val,
-                        best_val_loss=best_val_loss)
-
-            pbar.close()
-            pass_time = time.time() - t_pass
-            logger.log(f"Pass {pass_num} complete in {pass_time:.0f}s "
-                       f"({global_step} total steps)")
-
-        # Final loss curve
-        save_loss_curves(step_losses, epoch_train_losses,
-                         epoch_val_losses, grad_norms, root)
-
+    # Precompute Min-SNR-γ weights per sigma level
+    # SNR(σ) = 1/σ² for VP schedule; w(σ) = min(SNR(σ), γ)
+    if snr_gamma > 0:
+        snr = 1.0 / sigma_levels.pow(2)
+        snr_weights = torch.clamp(snr, max=snr_gamma)
+        # Normalize so mean weight = 1 (preserves overall loss scale)
+        snr_weights = snr_weights / snr_weights.mean()
     else:
-        # =============================================================
-        # Original epoch-based training
-        # =============================================================
-        # LR warmup + cosine decay
-        warmup_steps = max(warmup_epochs, 0)
-        if warmup_steps > 0 and num_epochs > warmup_steps:
-            warmup_sched = torch.optim.lr_scheduler.LinearLR(
-                optimizer, start_factor=0.01, total_iters=warmup_steps)
-            cosine_sched = torch.optim.lr_scheduler.CosineAnnealingLR(
-                optimizer, T_max=max(num_epochs - warmup_steps, 1),
-                eta_min=lr * 0.01)
-            lr_scheduler = torch.optim.lr_scheduler.SequentialLR(
-                optimizer, [warmup_sched, cosine_sched],
-                milestones=[warmup_steps])
-        else:
-            lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                optimizer, T_max=max(num_epochs, 10), eta_min=lr * 0.01)
+        snr_weights = torch.ones(n_sigmas, device=device)
 
-        for epoch in range(1, num_epochs + 1):
-            t_epoch = time.time()
-            classifier.train()
-            order = np.random.permutation(n_train)
-            epoch_loss = 0.0
-            epoch_target_energy = 0.0
-            num_batches = 0
+    # Step-based LR warmup + cosine decay
+    warmup_lr_steps = max(int(total_steps * 0.05), 1)
+    if warmup_lr_steps > 0 and total_steps > warmup_lr_steps:
+        warmup_sched = torch.optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=0.01, total_iters=warmup_lr_steps)
+        cosine_sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=max(total_steps - warmup_lr_steps, 1),
+            eta_min=lr * 0.01)
+        lr_scheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimizer, [warmup_sched, cosine_sched],
+            milestones=[warmup_lr_steps])
+    else:
+        lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=max(total_steps, 10), eta_min=lr * 0.01)
 
-            pbar = tqdm.tqdm(range(0, n_train, batch_size),
-                             desc=f"Epoch {epoch}/{num_epochs}")
+    logger.log(f"Sequential sigma: {n_sigmas} levels, "
+               f"sigma_batch_size={sigma_batch_size}, "
+               f"steps/sample={steps_per_sample}, total={total_steps}")
+    logger.log(f"  sigma range: [{sigma_levels[-1]:.4f}, {sigma_levels[0]:.4f}]")
+    if snr_gamma > 0:
+        logger.log(f"  Min-SNR-γ={snr_gamma}: weight range "
+                   f"[{snr_weights.min():.4f}, {snr_weights.max():.4f}], "
+                   f"mean={snr_weights.mean():.4f}")
+    logger.log(f"  LR warmup: {warmup_lr_steps} steps, cosine to {total_steps}")
+    logger.update_progress(total_steps=total_steps)
 
-            for start in pbar:
-                idx = order[start:start+batch_size]
-                x0 = images[idx]
-                y_batch = measurements[idx]
-                B = x0.shape[0]
+    global_step = 0
+    log_interval = max(total_steps // 100, 50)
+    running_loss = 0.0
+    running_rel = 0.0
+    running_count = 0
 
-                sigma = sample_sigma(net, B, device)
+    for pass_num in range(1, num_passes + 1):
+        order = np.random.permutation(n_train)
+        classifier.train()
+        t_pass = time.time()
+
+        pbar = tqdm.tqdm(range(n_train),
+                         desc=f"Pass {pass_num}/{num_passes}")
+
+        for sample_idx in pbar:
+            i = order[sample_idx]
+            x0 = images[i:i+1]
+            y_single = measurements[i:i+1]
+
+            # Iterate through all sigma levels for this sample
+            for sig_start in range(0, n_sigmas, sigma_batch_size):
+                sig_end = min(sig_start + sigma_batch_size, n_sigmas)
+                B = sig_end - sig_start
+                sigma = sigma_levels[sig_start:sig_end]
+
+                # Repeat sample for each sigma in batch
+                x0_rep = x0.expand(B, -1, -1, -1)
+                y_rep = y_single.expand(B, *[-1] * (y_single.ndim - 1))
                 sigma_bc = sigma.view(-1, 1, 1, 1)
-                eps = torch.randn_like(x0)
-                x_noisy = x0 + sigma_bc * eps
+                eps = torch.randn(B, *x0.shape[1:], device=device)
+                x_noisy = x0_rep + sigma_bc * eps
 
                 with torch.no_grad():
                     if target_mode == "tweedie":
@@ -717,7 +547,7 @@ def main(config: DictConfig):
                         y_hat = forward_op({'target': denoised})
                     else:  # direct
                         y_hat = forward_op({'target': x_noisy})
-                    residual = y_hat - y_batch
+                    residual = y_hat - y_rep
                     if classifier.measurement_decoder is not None:
                         if residual.is_complex():
                             target = torch.view_as_real(residual).flatten(1).float()
@@ -729,105 +559,130 @@ def main(config: DictConfig):
                         tnorm = target.norm(dim=-1, keepdim=True).clamp(min=1e-8)
                         target = target / tnorm
 
-                pred = classifier(x_noisy, sigma, y_batch)
-                loss = (pred - target).pow(2).flatten(1).sum(-1).mean()
+                pred = classifier(x_noisy, sigma, y_rep)
+                per_sample_loss = (pred - target).pow(2).flatten(1).sum(-1)  # [B]
+                w = snr_weights[sig_start:sig_end]  # [B]
+                loss = (w * per_sample_loss).mean()
+
                 optimizer.zero_grad()
                 loss.backward()
                 gn = torch.nn.utils.clip_grad_norm_(
                     classifier.parameters(), grad_clip).item()
                 grad_norms.append(gn)
                 optimizer.step()
+                lr_scheduler.step()
 
                 loss_val = loss.item()
+                step_losses.append(loss_val)
                 with torch.no_grad():
                     target_energy = target.pow(2).flatten(1).sum(-1).mean().item()
                     rel_err = loss_val / max(target_energy, 1e-10)
-                step_losses.append(loss_val)
-                epoch_loss += loss_val
-                epoch_target_energy += target_energy
-                num_batches += 1
-                pbar.set_postfix(loss=f"{loss_val:.6f}", rel=f"{rel_err:.3f}")
+                running_loss += loss_val
+                running_rel += rel_err
+                running_count += 1
+                global_step += 1
 
-            avg_train_loss = epoch_loss / max(num_batches, 1)
-            epoch_train_losses.append(avg_train_loss)
+                pbar.set_postfix(
+                    step=f"{global_step}/{total_steps}",
+                    loss=f"{loss_val:.4f}",
+                    rel=f"{rel_err:.3f}",
+                    lr=f"{optimizer.param_groups[0]['lr']:.2e}")
 
-            # Validation
-            classifier.eval()
-            val_loss = 0.0
-            val_batches = 0
-            if eval_images is not None:
-                with torch.no_grad():
-                    for start in range(0, n_val, batch_size):
-                        x0 = eval_images[start:start+batch_size]
-                        y_batch = eval_measurements[start:start+batch_size]
-                        B = x0.shape[0]
+                # Periodic logging
+                if global_step % log_interval == 0 and running_count > 0:
+                    avg_loss = running_loss / running_count
+                    avg_rel = running_rel / running_count
+                    avg_gn = np.mean(grad_norms[-running_count:])
+                    logger.log(
+                        f"Step {global_step:6d}/{total_steps} | "
+                        f"loss={avg_loss:.6f} | rel_err={avg_rel:.3f} | "
+                        f"lr={optimizer.param_groups[0]['lr']:.2e} | "
+                        f"gnorm={avg_gn:.4f}")
+                    running_loss = 0.0
+                    running_rel = 0.0
+                    running_count = 0
 
-                        sigma = sample_sigma(net, B, device)
-                        sigma_bc = sigma.view(-1, 1, 1, 1)
-                        eps = torch.randn_like(x0)
-                        x_noisy = x0 + sigma_bc * eps
-
-                        if target_mode == "tweedie":
-                            denoised = net(x_noisy, sigma)
-                            y_hat = forward_op({'target': denoised})
-                        else:  # direct
-                            y_hat = forward_op({'target': x_noisy})
-                        residual = y_hat - y_batch
-                        if classifier.measurement_decoder is not None:
-                            if residual.is_complex():
-                                target = torch.view_as_real(residual).flatten(1).float()
+                # Periodic validation
+                if (global_step % val_every_steps == 0
+                        and eval_images is not None):
+                    classifier.eval()
+                    val_loss = 0.0
+                    val_batches = 0
+                    with torch.no_grad():
+                        for v_st in range(0, n_val, batch_size):
+                            x0v = eval_images[v_st:v_st+batch_size]
+                            y_bv = eval_measurements[v_st:v_st+batch_size]
+                            Bv = x0v.shape[0]
+                            sv = sample_sigma(net, Bv, device)
+                            sv_bc = sv.view(-1, 1, 1, 1)
+                            epsv = torch.randn_like(x0v)
+                            x_nv = x0v + sv_bc * epsv
+                            if target_mode == "tweedie":
+                                dv = net(x_nv, sv)
+                                y_hv = forward_op({'target': dv})
                             else:
-                                target = residual.flatten(1).float()
-                        else:
-                            target = residual
-                        if normalize_target:
-                            tnorm = target.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-                            target = target / tnorm
-                        pred = classifier(x_noisy, sigma, y_batch)
-                        val_loss += (pred - target).pow(2).flatten(1).sum(-1).mean().item()
-                        val_batches += 1
+                                y_hv = forward_op({'target': x_nv})
+                            rv = y_hv - y_bv
+                            if classifier.measurement_decoder is not None:
+                                if rv.is_complex():
+                                    tv = torch.view_as_real(rv).flatten(1).float()
+                                else:
+                                    tv = rv.flatten(1).float()
+                            else:
+                                tv = rv
+                            if normalize_target:
+                                tn = tv.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+                                tv = tv / tn
+                            pv = classifier(x_nv, sv, y_bv)
+                            val_loss += (pv - tv).pow(2).flatten(1).sum(-1).mean().item()
+                            val_batches += 1
+                    avg_val = val_loss / max(val_batches, 1)
+                    epoch_val_losses.append(avg_val)
+                    avg_recent = np.mean(
+                        step_losses[max(0, len(step_losses) - val_every_steps):])
+                    epoch_train_losses.append(avg_recent)
 
-            avg_val_loss = val_loss / max(val_batches, 1) if val_batches > 0 \
-                else avg_train_loss
-            epoch_val_losses.append(avg_val_loss)
+                    logger.log(f"  VAL @ step {global_step}: "
+                               f"train_avg={avg_recent:.6f} | "
+                               f"val={avg_val:.6f}")
 
-            lr_scheduler.step()
-            epoch_time = time.time() - t_epoch
-            avg_gnorm = np.mean(grad_norms[-num_batches:]) if num_batches > 0 else 0
+                    is_best = avg_val < best_val_loss
+                    if is_best:
+                        best_val_loss = avg_val
+                        save_classifier(
+                            classifier,
+                            str(root / "classifier_best.pt"),
+                            metadata={"step": global_step,
+                                      "val_loss": avg_val,
+                                      "target_mode": target_mode})
+                        logger.log(f"  -> New best val_loss={avg_val:.6f}")
 
-            avg_target_energy = epoch_target_energy / max(num_batches, 1)
-            avg_rel_err = avg_train_loss / max(avg_target_energy, 1e-10)
-            logger.log(f"Epoch {epoch:3d}/{num_epochs} | "
-                       f"train={avg_train_loss:.6f} | val={avg_val_loss:.6f} | "
-                       f"rel_err={avg_rel_err:.3f} | "
-                       f"lr={optimizer.param_groups[0]['lr']:.2e} | "
-                       f"gnorm={avg_gnorm:.4f} | time={epoch_time:.0f}s")
+                    classifier.train()
+                    save_loss_curves(step_losses, epoch_train_losses,
+                                     epoch_val_losses, grad_norms, root)
 
-            # Save best
-            is_best = avg_val_loss < best_val_loss
-            if is_best:
-                best_val_loss = avg_val_loss
-                save_classifier(classifier, str(root / "classifier_best.pt"),
-                                metadata={"epoch": epoch,
-                                          "val_loss": avg_val_loss,
-                                          "target_mode": target_mode})
-                logger.log(f"  -> New best val_loss={avg_val_loss:.6f}")
+                # Periodic checkpoint
+                if global_step % save_every_steps == 0:
+                    save_classifier(
+                        classifier,
+                        str(root / f"classifier_step{global_step}.pt"),
+                        metadata={"step": global_step,
+                                  "target_mode": target_mode})
 
-            # Periodic checkpoint
-            if epoch % save_every == 0:
-                save_classifier(classifier, str(root / f"classifier_epoch{epoch}.pt"),
-                                metadata={"epoch": epoch,
-                                          "train_loss": avg_train_loss,
-                                          "val_loss": avg_val_loss,
-                                          "target_mode": target_mode})
+                # Progress update
+                logger.update_progress(
+                    status="training", epoch=pass_num,
+                    step=global_step, train_loss=loss_val,
+                    best_val_loss=best_val_loss)
 
-            # Progress + loss curves
-            logger.update_progress(
-                status="training", epoch=epoch,
-                train_loss=avg_train_loss, val_loss=avg_val_loss,
-                best_val_loss=best_val_loss)
-            save_loss_curves(step_losses, epoch_train_losses, epoch_val_losses,
-                             grad_norms, root)
+        pbar.close()
+        pass_time = time.time() - t_pass
+        logger.log(f"Pass {pass_num} complete in {pass_time:.0f}s "
+                   f"({global_step} total steps)")
+
+    # Final loss curve
+    save_loss_curves(step_losses, epoch_train_losses,
+                     epoch_val_losses, grad_norms, root)
 
     # --- 7. Save final ---
     final_meta = {
@@ -835,17 +690,14 @@ def main(config: DictConfig):
         "train_pct": train_pct,
         "target_mode": target_mode,
         "normalize_target": normalize_target,
+        "snr_gamma": snr_gamma,
         "best_val_loss": best_val_loss,
-        "sequential_sigma": sequential_sigma,
+        "num_passes": num_passes,
+        "num_sigma_steps": num_sigma_steps,
+        "sigma_batch_size": sigma_batch_size,
+        "total_steps": n_train * num_passes * math.ceil(
+            num_sigma_steps / sigma_batch_size),
     }
-    if sequential_sigma:
-        final_meta["num_passes"] = num_passes
-        final_meta["num_sigma_steps"] = num_sigma_steps
-        final_meta["sigma_batch_size"] = sigma_batch_size
-        final_meta["total_steps"] = n_train * num_passes * math.ceil(
-            num_sigma_steps / sigma_batch_size)
-    else:
-        final_meta["epochs"] = num_epochs
     if epoch_train_losses:
         final_meta["final_train_loss"] = epoch_train_losses[-1]
     if epoch_val_losses:
