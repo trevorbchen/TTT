@@ -120,7 +120,8 @@ for lr in 1e-4 3e-4 1e-3; do
             +cbg.num_sigma_steps=200 \
             +cbg.sigma_batch_size=8 \
             +cbg.val_every_steps=300 \
-            +cbg.save_every_steps=5000 \
+            +cbg.save_every_steps=999999 \
+            +cbg.save_final=false \
             +cbg.val_fraction=0.1 \
             +cbg.grad_clip=10.0 \
             +cbg.save_dir=$SWEEP_DIR \

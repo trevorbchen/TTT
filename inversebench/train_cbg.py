@@ -312,6 +312,7 @@ def main(config: DictConfig):
     val_every_steps  = cbg.get("val_every_steps", 500)
     save_every_steps = cbg.get("save_every_steps", 2000)
     snr_gamma        = cbg.get("snr_gamma", 5.0)  # Min-SNR-γ weighting (0=off)
+    save_final       = cbg.get("save_final", True)  # save classifier_final.pt
     assert target_mode in ("tweedie", "direct"), \
         f"Unknown target_mode={target_mode!r}, expected 'tweedie' or 'direct'"
 
@@ -702,9 +703,15 @@ def main(config: DictConfig):
         final_meta["final_train_loss"] = epoch_train_losses[-1]
     if epoch_val_losses:
         final_meta["final_val_loss"] = epoch_val_losses[-1]
-    save_classifier(classifier, str(root / "classifier_final.pt"),
-                    metadata=final_meta)
-    logger.log(f"Saved classifier_final.pt")
+    if save_final:
+        save_classifier(classifier, str(root / "classifier_final.pt"),
+                        metadata=final_meta)
+        logger.log(f"Saved classifier_final.pt")
+    else:
+        # Save just the metadata (no weights) for sweep analysis
+        with open(str(root / "final_meta.json"), "w") as f:
+            json.dump(final_meta, f, indent=2)
+        logger.log(f"Skipped classifier_final.pt (save_final=false)")
 
     # --- 8. Evaluate ---
     if eval_images is not None:
