@@ -142,50 +142,45 @@ echo "=========================================="
 echo "Phase 1b: Selecting best config"
 echo "=========================================="
 
-read BEST_LR BEST_SNRG BEST_NORM BEST_PASSES BEST_LOSS BEST_DIR <<< $(python -c "
-import json, glob, os, re
-
-best_loss = float('inf')
-best_lr, best_snrg, best_norm, best_passes, best_dir = '', '', '', '', ''
-
-print('  All sweep results:')
+# Print leaderboard (display only)
+python -c "
+import json, glob, os, yaml
+results = []
 for p in sorted(glob.glob('$SWEEP_DIR/*/progress.json')):
     try:
         d = os.path.dirname(p)
-        name = os.path.basename(d)
         state = json.load(open(p))
         vl = state.get('best_val_loss') or state.get('val_loss')
-        if vl is None:
-            continue
+        if vl is None: continue
+        cfg = yaml.safe_load(open(os.path.join(d, 'config.yaml'))).get('cbg', {})
+        results.append((vl, cfg.get('lr'), cfg.get('snr_gamma',0), cfg.get('normalize_target',True), cfg.get('num_passes',1)))
+    except: pass
+results.sort()
+for vl, lr, snrg, norm, ps in results:
+    tag = ' <-- BEST' if vl == results[0][0] else ''
+    print(f'    lr={lr} snrg={snrg} norm={norm} passes={ps} -> val={vl:.6f}{tag}')
+"
 
-        # Parse HPs from directory name
-        lr_str = name.split('_lr')[1].split('_ch')[0]
-
-        m = re.search(r'_snrg([\d.]+)', name)
-        snrg_str = m.group(1) if m else '0'
-        if '_nosnr' in name:
-            snrg_str = '0'
-
-        # normalize_target: encoded in config.yaml
-        cfg_path = os.path.join(d, 'config.yaml')
-        norm_str = 'true'
-        passes_str = '1'
-        if os.path.exists(cfg_path):
-            import yaml
-            cfg = yaml.safe_load(open(cfg_path))
-            cbg = cfg.get('cbg', {})
-            norm_str = str(cbg.get('normalize_target', True)).lower()
-            passes_str = str(cbg.get('num_passes', 1))
-
-        marker = ' <-- BEST' if vl < best_loss else ''
-        print(f'    lr={lr_str} snrg={snrg_str} norm={norm_str} passes={passes_str} -> val_loss={vl:.6f}{marker}')
-
+# Extract best config (single clean line to stdout)
+read BEST_LR BEST_SNRG BEST_NORM BEST_PASSES BEST_LOSS BEST_DIR <<< $(python -c "
+import json, glob, os, yaml
+best_loss = float('inf')
+best_lr, best_snrg, best_norm, best_passes, best_dir = '', '', '', '', ''
+for p in sorted(glob.glob('$SWEEP_DIR/*/progress.json')):
+    try:
+        d = os.path.dirname(p)
+        state = json.load(open(p))
+        vl = state.get('best_val_loss') or state.get('val_loss')
+        if vl is None: continue
+        cfg = yaml.safe_load(open(os.path.join(d, 'config.yaml'))).get('cbg', {})
         if vl < best_loss:
             best_loss = vl
-            best_lr, best_snrg, best_norm, best_passes, best_dir = lr_str, snrg_str, norm_str, passes_str, d
-    except Exception as e:
-        print(f'    skip {p}: {e}')
-
+            best_lr = str(cfg.get('lr', ''))
+            best_snrg = str(cfg.get('snr_gamma', 0))
+            best_norm = str(cfg.get('normalize_target', True)).lower()
+            best_passes = str(cfg.get('num_passes', 1))
+            best_dir = d
+    except: pass
 print(f'{best_lr} {best_snrg} {best_norm} {best_passes} {best_loss} {best_dir}')
 ")
 
