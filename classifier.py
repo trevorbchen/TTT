@@ -97,13 +97,14 @@ class MeasurementDecoder(nn.Module):
     (e.g. 64) rather than out_channels (e.g. 1), avoiding a severe
     information bottleneck.
 
-    Architecture: AdaptiveAvgPool2d → Flatten → [Linear → LN → GELU] x2 → Linear
-    With base_channels=64, pool_size=8, hidden=2048:
-        pool_dim=4096 → 2048 → 2048 → meas_flat_dim
+    Architecture: AdaptiveAvgPool2d → Flatten → [Linear → GELU] x2 → Linear
+    No LayerNorm — preserves gradient flow for classifier guidance at inference.
+    With base_channels=64, pool_size=8, hidden=512:
+        pool_dim=4096 → 512 → 512 → meas_flat_dim
     """
 
     def __init__(self, in_channels: int, meas_flat_dim: int,
-                 pool_size: int = 8, hidden: int = 2048):
+                 pool_size: int = 8, hidden: int = 512):
         super().__init__()
         self.meas_flat_dim = meas_flat_dim
         self.pool = nn.AdaptiveAvgPool2d(pool_size)
@@ -112,10 +113,8 @@ class MeasurementDecoder(nn.Module):
         self.proj = nn.Sequential(
             nn.Flatten(1),
             nn.Linear(pool_dim, hidden),
-            nn.LayerNorm(hidden),
             nn.GELU(),
             nn.Linear(hidden, hidden),
-            nn.LayerNorm(hidden),
             nn.GELU(),
             nn.Linear(hidden, meas_flat_dim),
         )
