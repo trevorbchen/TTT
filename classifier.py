@@ -39,7 +39,7 @@ class QKNormAttention(nn.Module):
     prevents attention logit growth and stabilizes training at any depth.
     """
 
-    def __init__(self, dim, num_heads=4):
+    def __init__(self, dim, num_heads=4, dropout=0.0):
         super().__init__()
         assert dim % num_heads == 0
         self.num_heads = num_heads
@@ -48,6 +48,8 @@ class QKNormAttention(nn.Module):
         self.norm = nn.LayerNorm(dim)
         self.qkv = nn.Linear(dim, dim * 3)
         self.out_proj = nn.Linear(dim, dim)
+        self.attn_drop = nn.Dropout(dropout)
+        self.resid_drop = nn.Dropout(dropout)
 
         # Xavier init for QKV, small init for output projection
         nn.init.xavier_uniform_(self.qkv.weight)
@@ -70,10 +72,11 @@ class QKNormAttention(nn.Module):
         scale = self.head_dim ** 0.5  # learnable-temperature equivalent
         attn = torch.matmul(q, k.transpose(-2, -1)) * scale
         attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
         out = torch.matmul(attn, v)  # [B, H, N, Dh]
 
         out = out.transpose(1, 2).reshape(B, N, D)
-        return x + self.out_proj(out)
+        return x + self.resid_drop(self.out_proj(out))
 
 
 class GEGLU_FFN(nn.Module):
@@ -83,12 +86,14 @@ class GEGLU_FFN(nn.Module):
     and multiplies element-wise. No dead neurons (unlike ReLU).
     """
 
-    def __init__(self, dim, mult=2):
+    def __init__(self, dim, mult=2, dropout=0.0):
         super().__init__()
         hidden = int(dim * mult)
         self.norm = nn.LayerNorm(dim)
         self.w_gate = nn.Linear(dim, hidden * 2)  # gate + value
         self.w_out = nn.Linear(hidden, dim)
+        self.ffn_drop = nn.Dropout(dropout)
+        self.resid_drop = nn.Dropout(dropout)
 
         nn.init.xavier_uniform_(self.w_gate.weight)
         nn.init.zeros_(self.w_gate.bias)
@@ -98,17 +103,17 @@ class GEGLU_FFN(nn.Module):
     def forward(self, x):
         h = self.norm(x)
         gate, val = self.w_gate(h).chunk(2, dim=-1)
-        h = F.gelu(gate) * val
-        return x + self.w_out(h)
+        h = self.ffn_drop(F.gelu(gate) * val)
+        return x + self.resid_drop(self.w_out(h))
 
 
 class TransformerBlock(nn.Module):
     """Pre-norm transformer block: QKNormAttention + GEGLU FFN."""
 
-    def __init__(self, dim, num_heads=4, ffn_mult=2):
+    def __init__(self, dim, num_heads=4, ffn_mult=2, dropout=0.0):
         super().__init__()
-        self.attn = QKNormAttention(dim, num_heads)
-        self.ffn = GEGLU_FFN(dim, ffn_mult)
+        self.attn = QKNormAttention(dim, num_heads, dropout=dropout)
+        self.ffn = GEGLU_FFN(dim, ffn_mult, dropout=dropout)
 
     def forward(self, x):
         x = self.attn(x)
@@ -130,7 +135,7 @@ class TransformerCBG(nn.Module):
     def __init__(self, img_resolution=256, img_channels=1,
                  obs_shape=(20, 360), meas_flat_dim=14400,
                  embed_dim=256, num_layers=4, num_heads=4, ffn_mult=2,
-                 patch_size=16):
+                 patch_size=16, dropout=0.0):
         super().__init__()
         self.img_resolution = img_resolution
         self.img_channels = img_channels
@@ -141,6 +146,7 @@ class TransformerCBG(nn.Module):
         self.num_heads = num_heads
         self.ffn_mult = ffn_mult
         self.patch_size = patch_size
+        self.dropout = dropout
 
         # --- Image tokenization (ViT-style) ---
         num_patches = (img_resolution // patch_size) ** 2  # e.g. 256
@@ -166,9 +172,12 @@ class TransformerCBG(nn.Module):
             nn.Linear(embed_dim, embed_dim),
         )
 
+        # --- Dropout on combined token embeddings ---
+        self.emb_drop = nn.Dropout(dropout)
+
         # --- Transformer blocks ---
         self.blocks = nn.ModuleList([
-            TransformerBlock(embed_dim, num_heads, ffn_mult)
+            TransformerBlock(embed_dim, num_heads, ffn_mult, dropout=dropout)
             for _ in range(num_layers)
         ])
         self.final_norm = nn.LayerNorm(embed_dim)
@@ -219,6 +228,7 @@ class TransformerCBG(nn.Module):
         # --- 4. Concatenate: [sigma | image | measurement] ---
         tokens = torch.cat([sigma_token, img_tokens, meas_tokens], dim=1)
         # total tokens: 1 + num_patches + num_receivers = 277
+        tokens = self.emb_drop(tokens)
 
         # --- 5. Transformer ---
         for block in self.blocks:
@@ -827,6 +837,7 @@ def save_classifier(classifier, path, metadata=None):
             'num_heads': classifier.num_heads,
             'ffn_mult': classifier.ffn_mult,
             'patch_size': classifier.patch_size,
+            'dropout': classifier.dropout,
         }
         checkpoint = {
             'state_dict': classifier.state_dict(),

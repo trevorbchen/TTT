@@ -321,6 +321,7 @@ def main(config: DictConfig):
     t_num_layers     = cbg.get("num_layers", 4)
     t_num_heads      = cbg.get("num_heads", 4)
     t_ffn_mult       = cbg.get("ffn_mult", 2)
+    t_dropout        = cbg.get("dropout", 0.0)
     assert target_mode in ("tweedie", "direct"), \
         f"Unknown target_mode={target_mode!r}, expected 'tweedie' or 'direct'"
     assert arch in ("unet", "transformer"), \
@@ -351,7 +352,7 @@ def main(config: DictConfig):
                f"lr={lr}, train_pct={train_pct}")
     if arch == "transformer":
         logger.log(f"  transformer: embed_dim={t_embed_dim}, num_layers={t_num_layers}, "
-                   f"num_heads={t_num_heads}, ffn_mult={t_ffn_mult}")
+                   f"num_heads={t_num_heads}, ffn_mult={t_ffn_mult}, dropout={t_dropout}")
     logger.log(f"  snr_gamma={snr_gamma} ({'enabled' if snr_gamma > 0 else 'disabled'})")
     logger.log(f"  output: {root}")
     logger.log(f"  device: {device}")
@@ -456,6 +457,7 @@ def main(config: DictConfig):
             num_layers=t_num_layers,
             num_heads=t_num_heads,
             ffn_mult=t_ffn_mult,
+            dropout=t_dropout,
         ).to(device)
         num_params = sum(p.numel() for p in classifier.parameters())
         logger.log(f"TransformerCBG: {num_params/1e6:.2f}M parameters")
