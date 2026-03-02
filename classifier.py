@@ -97,10 +97,10 @@ class MeasurementDecoder(nn.Module):
     (e.g. 64) rather than out_channels (e.g. 1), avoiding a severe
     information bottleneck.
 
-    Architecture: AdaptiveAvgPool2d → Flatten → [Linear → GELU] x2 → Linear
-    No LayerNorm — preserves gradient flow for classifier guidance at inference.
-    With base_channels=64, pool_size=8, hidden=512:
-        pool_dim=4096 → 512 → 512 → meas_flat_dim
+    Architecture: AdaptiveAvgPool2d → Flatten → ResidualMLP(LeakyReLU) → Linear
+    Uses residual connections + LeakyReLU to prevent dead-neuron collapse.
+    With base_channels=64, pool_size=8, hidden=2048:
+        pool_dim=4096 → hidden → hidden → meas_flat_dim
     """
 
     def __init__(self, in_channels: int, meas_flat_dim: int,
@@ -110,26 +110,36 @@ class MeasurementDecoder(nn.Module):
         self.pool = nn.AdaptiveAvgPool2d(pool_size)
         pool_dim = in_channels * pool_size * pool_size
         hidden = min(pool_dim, hidden)
-        self.proj = nn.Sequential(
-            nn.Flatten(1),
-            nn.Linear(pool_dim, hidden),
-            nn.GELU(),
-            nn.Linear(hidden, hidden),
-            nn.GELU(),
-            nn.Linear(hidden, meas_flat_dim),
-        )
-        # Kaiming init for hidden layers, small init for output layer
-        for m in self.proj:
-            if isinstance(m, nn.Linear):
-                nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
+
+        # Input projection
+        self.flatten = nn.Flatten(1)
+        self.input_proj = nn.Linear(pool_dim, hidden)
+
+        # Residual blocks with LeakyReLU (no dead zone)
+        self.act1 = nn.LeakyReLU(0.2)
+        self.res1 = nn.Linear(hidden, hidden)
+        self.act2 = nn.LeakyReLU(0.2)
+        self.res2 = nn.Linear(hidden, hidden)
+
+        # Output projection
+        self.out_proj = nn.Linear(hidden, meas_flat_dim)
+
+        # Kaiming init for hidden layers
+        for m in [self.input_proj, self.res1, self.res2]:
+            nn.init.kaiming_normal_(m.weight, a=0.2, nonlinearity='leaky_relu')
+            nn.init.zeros_(m.bias)
         # Small init on output layer so decoder starts near zero
-        out_layer = self.proj[-1]
-        nn.init.normal_(out_layer.weight, std=0.01)
+        nn.init.normal_(self.out_proj.weight, std=0.01)
+        nn.init.zeros_(self.out_proj.bias)
 
     def forward(self, h):
-        return self.proj(self.pool(h))
+        h = self.flatten(self.pool(h))
+        h = self.input_proj(h)
+        # Residual block 1
+        h = h + self.res1(self.act1(h))
+        # Residual block 2
+        h = h + self.res2(self.act2(h))
+        return self.out_proj(h)
 
 
 # ---------------------------------------------------------------------------
