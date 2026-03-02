@@ -496,10 +496,11 @@ def main(config: DictConfig):
     logger.update_progress(status="training")
 
     # =================================================================
-    # Sequential sigma training (TTT-style):
-    #   For each sample, iterate through ALL sigma levels.
-    #   Sigma levels are batched (sigma_batch_size) for efficiency.
-    #   Single pass through dataset by default.
+    # Shuffled (sample, sigma) training:
+    #   Create all (sample_idx, sigma_batch_start) pairs, shuffle them.
+    #   Each step trains on one sample at one sigma batch, but the order
+    #   is randomized so the model sees diverse samples between steps
+    #   (prevents catastrophic forgetting from sequential sigma sweeps).
     # =================================================================
     sigma_levels = get_vp_sigma_steps(num_sigma_steps).to(device)
     n_sigmas = len(sigma_levels)
@@ -531,7 +532,7 @@ def main(config: DictConfig):
         lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer, T_max=max(total_steps, 10), eta_min=lr * 0.01)
 
-    logger.log(f"Sequential sigma: {n_sigmas} levels, "
+    logger.log(f"Shuffled (sample, sigma) training: {n_sigmas} levels, "
                f"sigma_batch_size={sigma_batch_size}, "
                f"steps/sample={steps_per_sample}, total={total_steps}")
     logger.log(f"  sigma range: [{sigma_levels[-1]:.4f}, {sigma_levels[0]:.4f}]")
@@ -549,20 +550,20 @@ def main(config: DictConfig):
     running_count = 0
 
     for pass_num in range(1, num_passes + 1):
-        order = np.random.permutation(n_train)
+        # Build all (sample_idx, sigma_batch_start) pairs and shuffle
+        sig_starts = list(range(0, n_sigmas, sigma_batch_size))
+        pairs = [(i, s) for i in range(n_train) for s in sig_starts]
+        np.random.shuffle(pairs)
+
         classifier.train()
         t_pass = time.time()
 
-        pbar = tqdm.tqdm(range(n_train),
+        pbar = tqdm.tqdm(pairs,
                          desc=f"Pass {pass_num}/{num_passes}")
 
-        for sample_idx in pbar:
-            i = order[sample_idx]
-            x0 = images[i:i+1]
-            y_single = measurements[i:i+1]
-
-            # Iterate through all sigma levels for this sample
-            for sig_start in range(0, n_sigmas, sigma_batch_size):
+        for (i, sig_start) in pbar:
+                x0 = images[i:i+1]
+                y_single = measurements[i:i+1]
                 sig_end = min(sig_start + sigma_batch_size, n_sigmas)
                 B = sig_end - sig_start
                 sigma = sigma_levels[sig_start:sig_end]
