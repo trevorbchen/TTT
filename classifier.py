@@ -97,10 +97,11 @@ class MeasurementDecoder(nn.Module):
     (e.g. 64) rather than out_channels (e.g. 1), avoiding a severe
     information bottleneck.
 
-    Architecture: AdaptiveAvgPool2d → Flatten → ResidualMLP(LeakyReLU) → Linear
-    Uses residual connections + LeakyReLU to prevent dead-neuron collapse.
-    With base_channels=64, pool_size=8, hidden=2048:
-        pool_dim=4096 → hidden → hidden → meas_flat_dim
+    Architecture: AdaptiveAvgPool2d → Flatten → PreNorm-ResidualMLP → Linear
+    Pre-norm residual (transformer-style): h = h + Linear(LeakyReLU(LN(h)))
+    - LayerNorm inside the branch stabilizes activations (prevents spikes)
+    - Skip connection on the main path preserves gradient flow
+    - LeakyReLU(0.2) has no dead zone for negative inputs
     """
 
     def __init__(self, in_channels: int, meas_flat_dim: int,
@@ -115,9 +116,12 @@ class MeasurementDecoder(nn.Module):
         self.flatten = nn.Flatten(1)
         self.input_proj = nn.Linear(pool_dim, hidden)
 
-        # Residual blocks with LeakyReLU (no dead zone)
+        # Pre-norm residual blocks: h = h + Linear(LeakyReLU(LayerNorm(h)))
+        self.norm1 = nn.LayerNorm(hidden)
         self.act1 = nn.LeakyReLU(0.2)
         self.res1 = nn.Linear(hidden, hidden)
+
+        self.norm2 = nn.LayerNorm(hidden)
         self.act2 = nn.LeakyReLU(0.2)
         self.res2 = nn.Linear(hidden, hidden)
 
@@ -135,10 +139,10 @@ class MeasurementDecoder(nn.Module):
     def forward(self, h):
         h = self.flatten(self.pool(h))
         h = self.input_proj(h)
-        # Residual block 1
-        h = h + self.res1(self.act1(h))
-        # Residual block 2
-        h = h + self.res2(self.act2(h))
+        # Pre-norm residual block 1
+        h = h + self.res1(self.act1(self.norm1(h)))
+        # Pre-norm residual block 2
+        h = h + self.res2(self.act2(self.norm2(h)))
         return self.out_proj(h)
 
 
