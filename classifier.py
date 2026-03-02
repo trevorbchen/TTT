@@ -25,6 +25,211 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple
+from einops import rearrange
+
+
+# ---------------------------------------------------------------------------
+# TransformerCBG components (ViT-style pure transformer)
+# ---------------------------------------------------------------------------
+
+class QKNormAttention(nn.Module):
+    """Multi-head self-attention with QK normalization and pre-LayerNorm.
+
+    QK-norm (per-head L2 normalization of Q and K before dot product)
+    prevents attention logit growth and stabilizes training at any depth.
+    """
+
+    def __init__(self, dim, num_heads=4):
+        super().__init__()
+        assert dim % num_heads == 0
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+
+        self.norm = nn.LayerNorm(dim)
+        self.qkv = nn.Linear(dim, dim * 3)
+        self.out_proj = nn.Linear(dim, dim)
+
+        # Xavier init for QKV, small init for output projection
+        nn.init.xavier_uniform_(self.qkv.weight)
+        nn.init.zeros_(self.qkv.bias)
+        nn.init.normal_(self.out_proj.weight, std=0.02)
+        nn.init.zeros_(self.out_proj.bias)
+
+    def forward(self, x):
+        """x: [B, N, D] -> [B, N, D]"""
+        B, N, D = x.shape
+        h = self.norm(x)
+        qkv = self.qkv(h).reshape(B, N, 3, self.num_heads, self.head_dim)
+        q, k, v = qkv.permute(2, 0, 3, 1, 4).unbind(0)  # each [B, H, N, Dh]
+
+        # QK normalization: L2-normalize per head
+        q = F.normalize(q, dim=-1)
+        k = F.normalize(k, dim=-1)
+
+        # Scaled dot-product attention (scale by sqrt(head_dim) after norm)
+        scale = self.head_dim ** 0.5  # learnable-temperature equivalent
+        attn = torch.matmul(q, k.transpose(-2, -1)) * scale
+        attn = attn.softmax(dim=-1)
+        out = torch.matmul(attn, v)  # [B, H, N, Dh]
+
+        out = out.transpose(1, 2).reshape(B, N, D)
+        return x + self.out_proj(out)
+
+
+class GEGLU_FFN(nn.Module):
+    """Pre-norm feed-forward with GEGLU activation.
+
+    GEGLU: splits the projection into two halves, applies GELU to one
+    and multiplies element-wise. No dead neurons (unlike ReLU).
+    """
+
+    def __init__(self, dim, mult=2):
+        super().__init__()
+        hidden = int(dim * mult)
+        self.norm = nn.LayerNorm(dim)
+        self.w_gate = nn.Linear(dim, hidden * 2)  # gate + value
+        self.w_out = nn.Linear(hidden, dim)
+
+        nn.init.xavier_uniform_(self.w_gate.weight)
+        nn.init.zeros_(self.w_gate.bias)
+        nn.init.normal_(self.w_out.weight, std=0.02)
+        nn.init.zeros_(self.w_out.bias)
+
+    def forward(self, x):
+        h = self.norm(x)
+        gate, val = self.w_gate(h).chunk(2, dim=-1)
+        h = F.gelu(gate) * val
+        return x + self.w_out(h)
+
+
+class TransformerBlock(nn.Module):
+    """Pre-norm transformer block: QKNormAttention + GEGLU FFN."""
+
+    def __init__(self, dim, num_heads=4, ffn_mult=2):
+        super().__init__()
+        self.attn = QKNormAttention(dim, num_heads)
+        self.ffn = GEGLU_FFN(dim, ffn_mult)
+
+    def forward(self, x):
+        x = self.attn(x)
+        x = self.ffn(x)
+        return x
+
+
+class TransformerCBG(nn.Module):
+    """Pure transformer CBG architecture (~2-3M params).
+
+    Tokenizes image (ViT-style 16x16 patches), measurements (per-receiver),
+    and sigma (sinusoidal embedding). Concatenates all tokens, applies
+    N transformer blocks, then decodes measurement tokens to output.
+
+    Same forward interface as MeasurementPredictor: forward(x_t, sigma, y)
+    returns [B, meas_flat_dim] predictions.
+    """
+
+    def __init__(self, img_resolution=256, img_channels=1,
+                 obs_shape=(20, 360), meas_flat_dim=14400,
+                 embed_dim=256, num_layers=4, num_heads=4, ffn_mult=2,
+                 patch_size=16):
+        super().__init__()
+        self.img_resolution = img_resolution
+        self.img_channels = img_channels
+        self.obs_shape = obs_shape
+        self.meas_flat_dim = meas_flat_dim
+        self.embed_dim = embed_dim
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.ffn_mult = ffn_mult
+        self.patch_size = patch_size
+
+        # --- Image tokenization (ViT-style) ---
+        num_patches = (img_resolution // patch_size) ** 2  # e.g. 256
+        patch_dim = img_channels * patch_size * patch_size  # e.g. 256
+        self.num_patches = num_patches
+        self.patch_proj = nn.Linear(patch_dim, embed_dim)
+        self.patch_pos_emb = nn.Parameter(torch.randn(1, num_patches, embed_dim) * 0.02)
+
+        # --- Measurement tokenization (per-receiver) ---
+        # obs_shape = (num_receivers, samples_per_receiver), e.g. (20, 360)
+        self.num_receivers = obs_shape[0]
+        receiver_dim = 1
+        for s in obs_shape[1:]:
+            receiver_dim *= s
+        self.receiver_real_dim = receiver_dim * 2  # complex -> view_as_real doubles
+        self.meas_proj = nn.Linear(self.receiver_real_dim, embed_dim)
+        self.meas_pos_emb = nn.Parameter(torch.randn(1, self.num_receivers, embed_dim) * 0.02)
+
+        # --- Sigma token ---
+        self.sigma_mlp = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim),
+            nn.SiLU(),
+            nn.Linear(embed_dim, embed_dim),
+        )
+
+        # --- Transformer blocks ---
+        self.blocks = nn.ModuleList([
+            TransformerBlock(embed_dim, num_heads, ffn_mult)
+            for _ in range(num_layers)
+        ])
+        self.final_norm = nn.LayerNorm(embed_dim)
+
+        # --- Output head: decode measurement token positions ---
+        self.out_proj = nn.Linear(embed_dim, self.receiver_real_dim)
+        nn.init.normal_(self.out_proj.weight, std=0.02)
+        nn.init.zeros_(self.out_proj.bias)
+
+    def forward(self, x_t, sigma, y):
+        """
+        Args:
+            x_t:   [B, C, H, W] noisy image
+            sigma: [B] or scalar noise level
+            y:     [B, *obs_shape] measurements (complex)
+
+        Returns:
+            [B, meas_flat_dim] predicted measurement residual
+        """
+        B = x_t.shape[0]
+        device = x_t.device
+
+        # --- 1. Image tokens (ViT-style patching) ---
+        # [B, C, H, W] -> [B, num_patches, patch_dim]
+        patches = rearrange(x_t, 'b c (h p1) (w p2) -> b (h w) (c p1 p2)',
+                           p1=self.patch_size, p2=self.patch_size)
+        img_tokens = self.patch_proj(patches) + self.patch_pos_emb  # [B, 256, D]
+
+        # --- 2. Measurement tokens (per-receiver) ---
+        if y.is_complex():
+            y_real = torch.view_as_real(y).float()  # [B, 20, 360, 2]
+        else:
+            y_real = y.float()
+        y_flat = y_real.reshape(B, self.num_receivers, -1)  # [B, 20, 720]
+        meas_tokens = self.meas_proj(y_flat) + self.meas_pos_emb  # [B, 20, D]
+
+        # --- 3. Sigma token ---
+        if not isinstance(sigma, torch.Tensor):
+            sigma_t = torch.tensor([sigma], dtype=torch.float32,
+                                   device=device).expand(B)
+        else:
+            sigma_t = sigma.float().view(-1)
+            if sigma_t.numel() == 1:
+                sigma_t = sigma_t.expand(B)
+        sigma_emb = timestep_embedding(sigma_t.log(), self.embed_dim)
+        sigma_token = self.sigma_mlp(sigma_emb).unsqueeze(1)  # [B, 1, D]
+
+        # --- 4. Concatenate: [sigma | image | measurement] ---
+        tokens = torch.cat([sigma_token, img_tokens, meas_tokens], dim=1)
+        # total tokens: 1 + num_patches + num_receivers = 277
+
+        # --- 5. Transformer ---
+        for block in self.blocks:
+            tokens = block(tokens)
+        tokens = self.final_norm(tokens)
+
+        # --- 6. Extract measurement tokens and decode ---
+        meas_start = 1 + self.num_patches  # after sigma + image tokens
+        meas_out = tokens[:, meas_start:meas_start + self.num_receivers]  # [B, 20, D]
+        decoded = self.out_proj(meas_out)  # [B, 20, 720]
+        return decoded.reshape(B, -1)  # [B, 14400]
 
 
 # ---------------------------------------------------------------------------
@@ -605,43 +810,82 @@ class MeasurementPredictor(nn.Module):
 # ---------------------------------------------------------------------------
 
 def save_classifier(classifier, path, metadata=None):
-    """Save classifier state_dict + architecture config + optional metadata."""
-    config = {
-        'in_channels':   classifier.in_channels,
-        'y_channels':    classifier.y_channels,
-        'out_channels':  classifier.out_channels,
-        'out_size':      list(classifier.out_size),
-        'base_channels': classifier.base_channels,
-        'emb_dim':       classifier.emb_dim,
-        'channel_mult':  classifier.channel_mult,
-        'num_res_blocks': classifier.num_res_blocks,
-        'num_tokens':    classifier.num_tokens,
-    }
-    if classifier.obs_shape is not None:
-        config['obs_shape'] = list(classifier.obs_shape)
-        config['img_resolution'] = classifier.measurement_encoder.img_resolution
-        config['enc_spatial_size'] = classifier.measurement_encoder.enc_spatial_size
-    if classifier.meas_flat_dim is not None:
-        config['meas_flat_dim'] = classifier.meas_flat_dim
-        config['decoder_hidden'] = classifier.decoder_hidden
-    checkpoint = {
-        'state_dict': classifier.state_dict(),
-        'config': config,
-    }
-    # Save encoder build info so load_classifier can rebuild before load_state_dict
-    if (classifier.measurement_encoder is not None
-            and classifier.measurement_encoder._built):
-        checkpoint['meas_enc_in_dim'] = classifier.measurement_encoder._in_dim
+    """Save classifier state_dict + architecture config + optional metadata.
+
+    Dispatches on architecture type: 'unet' (MeasurementPredictor) or
+    'transformer' (TransformerCBG).
+    """
+    if isinstance(classifier, TransformerCBG):
+        config = {
+            'arch': 'transformer',
+            'img_resolution': classifier.img_resolution,
+            'img_channels': classifier.img_channels,
+            'obs_shape': list(classifier.obs_shape),
+            'meas_flat_dim': classifier.meas_flat_dim,
+            'embed_dim': classifier.embed_dim,
+            'num_layers': classifier.num_layers,
+            'num_heads': classifier.num_heads,
+            'ffn_mult': classifier.ffn_mult,
+            'patch_size': classifier.patch_size,
+        }
+        checkpoint = {
+            'state_dict': classifier.state_dict(),
+            'config': config,
+        }
+    else:
+        config = {
+            'arch': 'unet',
+            'in_channels':   classifier.in_channels,
+            'y_channels':    classifier.y_channels,
+            'out_channels':  classifier.out_channels,
+            'out_size':      list(classifier.out_size),
+            'base_channels': classifier.base_channels,
+            'emb_dim':       classifier.emb_dim,
+            'channel_mult':  classifier.channel_mult,
+            'num_res_blocks': classifier.num_res_blocks,
+            'num_tokens':    classifier.num_tokens,
+        }
+        if classifier.obs_shape is not None:
+            config['obs_shape'] = list(classifier.obs_shape)
+            config['img_resolution'] = classifier.measurement_encoder.img_resolution
+            config['enc_spatial_size'] = classifier.measurement_encoder.enc_spatial_size
+        if classifier.meas_flat_dim is not None:
+            config['meas_flat_dim'] = classifier.meas_flat_dim
+            config['decoder_hidden'] = classifier.decoder_hidden
+        checkpoint = {
+            'state_dict': classifier.state_dict(),
+            'config': config,
+        }
+        # Save encoder build info so load_classifier can rebuild before load_state_dict
+        if (classifier.measurement_encoder is not None
+                and classifier.measurement_encoder._built):
+            checkpoint['meas_enc_in_dim'] = classifier.measurement_encoder._in_dim
+
     if metadata:
         checkpoint.update(metadata)
     torch.save(checkpoint, path)
 
 
 def load_classifier(path, device='cuda'):
-    """Reconstruct MeasurementPredictor from a saved checkpoint."""
+    """Reconstruct classifier from a saved checkpoint.
+
+    Dispatches on config['arch']: 'transformer' -> TransformerCBG,
+    'unet' or missing -> MeasurementPredictor (backwards compatible).
+    """
     checkpoint = torch.load(path, map_location=device, weights_only=False)
     config = dict(checkpoint['config'])
-    # Convert obs_shape back to tuple if present
+
+    arch = config.pop('arch', 'unet')
+
+    if arch == 'transformer':
+        if 'obs_shape' in config:
+            config['obs_shape'] = tuple(config['obs_shape'])
+        classifier = TransformerCBG(**config).to(device)
+        classifier.load_state_dict(checkpoint['state_dict'])
+        classifier.eval()
+        return classifier
+
+    # UNet path (MeasurementPredictor) — original logic
     if 'obs_shape' in config:
         config['obs_shape'] = tuple(config['obs_shape'])
     classifier = MeasurementPredictor(**config).to(device)

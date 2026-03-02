@@ -43,7 +43,7 @@ _repo_root = str(Path(__file__).resolve().parent)
 if _repo_root not in sys.path:
     sys.path.insert(0, _repo_root)
 
-from classifier import MeasurementPredictor, save_classifier
+from classifier import MeasurementPredictor, TransformerCBG, save_classifier
 from utils.helper import open_url
 
 
@@ -169,7 +169,7 @@ def save_loss_curves(step_losses, epoch_train, epoch_val, grad_norms, root):
         ax.plot(range(window - 1, window - 1 + len(smoothed)), smoothed,
                 linewidth=1.5, label=f"smoothed (w={window})")
     ax.set_xlabel("Optimizer step")
-    ax.set_ylabel("MSE loss")
+    ax.set_ylabel("Loss")
     ax.set_title("Per-step loss")
     ax.legend()
     ax.grid(True, alpha=0.3)
@@ -179,7 +179,7 @@ def save_loss_curves(step_losses, epoch_train, epoch_val, grad_norms, root):
     ax.plot(epochs, epoch_train, "o-", label="train")
     ax.plot(epochs, epoch_val, "s-", label="val")
     ax.set_xlabel("Epoch")
-    ax.set_ylabel("Avg MSE loss")
+    ax.set_ylabel("Avg loss")
     ax.set_title("Per-epoch loss")
     ax.legend()
     ax.grid(True, alpha=0.3)
@@ -313,15 +313,29 @@ def main(config: DictConfig):
     save_every_steps = cbg.get("save_every_steps", 2000)
     snr_gamma        = cbg.get("snr_gamma", 5.0)  # Min-SNR-γ weighting (0=off)
     save_final       = cbg.get("save_final", True)  # save classifier_final.pt
+    # Transformer CBG config
+    arch             = cbg.get("arch", "unet")  # "unet" or "transformer"
+    loss_type        = cbg.get("loss_type", "mse")  # "mse" or "cosine"
+    cosine_eps       = cbg.get("cosine_eps", 1e-6)
+    t_embed_dim      = cbg.get("embed_dim", 256)    # transformer embed dim
+    t_num_layers     = cbg.get("num_layers", 4)
+    t_num_heads      = cbg.get("num_heads", 4)
+    t_ffn_mult       = cbg.get("ffn_mult", 2)
     assert target_mode in ("tweedie", "direct"), \
         f"Unknown target_mode={target_mode!r}, expected 'tweedie' or 'direct'"
+    assert arch in ("unet", "transformer"), \
+        f"Unknown arch={arch!r}, expected 'unet' or 'transformer'"
+    assert loss_type in ("mse", "cosine"), \
+        f"Unknown loss_type={loss_type!r}, expected 'mse' or 'cosine'"
 
     # --- Output directory ---
     problem_name = config.problem.get("name", "unknown")
     snr_tag = f"_snrg{snr_gamma}" if snr_gamma > 0 else "_nosnr"
     norm_tag = "_norm" if normalize_target else "_nonorm"
     pass_tag = f"_p{num_passes}" if num_passes > 1 else ""
-    root = Path(save_dir) / f"{problem_name}_cbg_{target_mode}_{train_pct}pct_lr{lr}_ch{base_channels}{snr_tag}{norm_tag}{pass_tag}"
+    arch_tag = f"_{arch}" if arch != "unet" else ""
+    loss_tag = f"_{loss_type}" if loss_type != "mse" else ""
+    root = Path(save_dir) / f"{problem_name}_cbg_{target_mode}_{train_pct}pct_lr{lr}_ch{base_channels}{arch_tag}{loss_tag}{snr_tag}{norm_tag}{pass_tag}"
     root.mkdir(parents=True, exist_ok=True)
 
     # --- Logger ---
@@ -330,10 +344,14 @@ def main(config: DictConfig):
     logger.log(f"  num_sigma_steps={num_sigma_steps}, "
                f"sigma_batch_size={sigma_batch_size}, "
                f"num_passes={num_passes}")
-    logger.log(f"  target_mode={target_mode}, normalize_target={normalize_target}, "
+    logger.log(f"  arch={arch}, loss_type={loss_type}, "
+               f"target_mode={target_mode}, normalize_target={normalize_target}, "
                f"base_channels={base_channels}, decoder_hidden={decoder_hidden}, "
                f"num_res_blocks={num_res_blocks}, num_tokens={num_tokens}, "
                f"lr={lr}, train_pct={train_pct}")
+    if arch == "transformer":
+        logger.log(f"  transformer: embed_dim={t_embed_dim}, num_layers={t_num_layers}, "
+                   f"num_heads={t_num_heads}, ffn_mult={t_ffn_mult}")
     logger.log(f"  snr_gamma={snr_gamma} ({'enabled' if snr_gamma > 0 else 'disabled'})")
     logger.log(f"  output: {root}")
     logger.log(f"  device: {device}")
@@ -427,29 +445,43 @@ def main(config: DictConfig):
                    f"out_size={out_size}")
 
     # --- 4. Build classifier ---
-    classifier = MeasurementPredictor(
-        in_channels=net.img_channels,
-        y_channels=y_channels,
-        out_channels=out_channels,
-        out_size=out_size,
-        base_channels=base_channels,
-        emb_dim=emb_dim,
-        channel_mult=channel_mult,
-        attn_heads=attn_heads,
-        obs_shape=obs_shape,
-        img_resolution=net.img_resolution,
-        meas_flat_dim=meas_flat_dim if not is_image_obs else None,
-        decoder_hidden=decoder_hidden,
-        num_res_blocks=num_res_blocks,
-        num_tokens=num_tokens,
-        enc_spatial_size=32,  # project to 32x32, not 256x256 (saves 500M params)
-    ).to(device)
-
-    num_params = sum(p.numel() for p in classifier.parameters())
-    dec_params = sum(p.numel() for p in classifier.measurement_decoder.parameters()) \
-        if classifier.measurement_decoder is not None else 0
-    logger.log(f"MeasurementPredictor: {num_params/1e6:.2f}M parameters "
-               f"(decoder: {dec_params/1e6:.2f}M)")
+    if arch == "transformer":
+        assert not is_image_obs, "TransformerCBG requires non-image observations"
+        classifier = TransformerCBG(
+            img_resolution=net.img_resolution,
+            img_channels=net.img_channels,
+            obs_shape=obs_shape,
+            meas_flat_dim=meas_flat_dim,
+            embed_dim=t_embed_dim,
+            num_layers=t_num_layers,
+            num_heads=t_num_heads,
+            ffn_mult=t_ffn_mult,
+        ).to(device)
+        num_params = sum(p.numel() for p in classifier.parameters())
+        logger.log(f"TransformerCBG: {num_params/1e6:.2f}M parameters")
+    else:
+        classifier = MeasurementPredictor(
+            in_channels=net.img_channels,
+            y_channels=y_channels,
+            out_channels=out_channels,
+            out_size=out_size,
+            base_channels=base_channels,
+            emb_dim=emb_dim,
+            channel_mult=channel_mult,
+            attn_heads=attn_heads,
+            obs_shape=obs_shape,
+            img_resolution=net.img_resolution,
+            meas_flat_dim=meas_flat_dim if not is_image_obs else None,
+            decoder_hidden=decoder_hidden,
+            num_res_blocks=num_res_blocks,
+            num_tokens=num_tokens,
+            enc_spatial_size=32,
+        ).to(device)
+        num_params = sum(p.numel() for p in classifier.parameters())
+        dec_params = sum(p.numel() for p in classifier.measurement_decoder.parameters()) \
+            if classifier.measurement_decoder is not None else 0
+        logger.log(f"MeasurementPredictor: {num_params/1e6:.2f}M parameters "
+                   f"(decoder: {dec_params/1e6:.2f}M)")
 
     # --- 5. Optimizer ---
     optimizer = torch.optim.AdamW(classifier.parameters(), lr=lr,
@@ -549,7 +581,13 @@ def main(config: DictConfig):
                     else:  # direct
                         y_hat = forward_op({'target': x_noisy})
                     residual = y_hat - y_rep
-                    if classifier.measurement_decoder is not None:
+                    # Flatten to measurement space
+                    if hasattr(classifier, 'measurement_decoder') and classifier.measurement_decoder is not None:
+                        if residual.is_complex():
+                            target = torch.view_as_real(residual).flatten(1).float()
+                        else:
+                            target = residual.flatten(1).float()
+                    elif isinstance(classifier, TransformerCBG):
                         if residual.is_complex():
                             target = torch.view_as_real(residual).flatten(1).float()
                         else:
@@ -561,7 +599,16 @@ def main(config: DictConfig):
                         target = target / tnorm
 
                 pred = classifier(x_noisy, sigma, y_rep)
-                per_sample_loss = (pred - target).pow(2).flatten(1).sum(-1)  # [B]
+                if loss_type == "cosine":
+                    # Cosine similarity loss; mask near-zero targets
+                    target_norm = target.norm(dim=-1)
+                    valid = target_norm > cosine_eps
+                    cos_sim = F.cosine_similarity(pred, target, dim=-1)  # [B]
+                    per_sample_loss = 1.0 - cos_sim  # [B]
+                    per_sample_loss = torch.where(valid, per_sample_loss,
+                                                  torch.zeros_like(per_sample_loss))
+                else:
+                    per_sample_loss = (pred - target).pow(2).flatten(1).sum(-1)  # [B]
                 w = snr_weights[sig_start:sig_end]  # [B]
                 loss = (w * per_sample_loss).mean()
 
@@ -624,7 +671,12 @@ def main(config: DictConfig):
                             else:
                                 y_hv = forward_op({'target': x_nv})
                             rv = y_hv - y_bv
-                            if classifier.measurement_decoder is not None:
+                            if hasattr(classifier, 'measurement_decoder') and classifier.measurement_decoder is not None:
+                                if rv.is_complex():
+                                    tv = torch.view_as_real(rv).flatten(1).float()
+                                else:
+                                    tv = rv.flatten(1).float()
+                            elif isinstance(classifier, TransformerCBG):
                                 if rv.is_complex():
                                     tv = torch.view_as_real(rv).flatten(1).float()
                                 else:
@@ -635,7 +687,16 @@ def main(config: DictConfig):
                                 tn = tv.norm(dim=-1, keepdim=True).clamp(min=1e-8)
                                 tv = tv / tn
                             pv = classifier(x_nv, sv, y_bv)
-                            val_loss += (pv - tv).pow(2).flatten(1).sum(-1).mean().item()
+                            if loss_type == "cosine":
+                                tv_norm = tv.norm(dim=-1)
+                                valid_v = tv_norm > cosine_eps
+                                cos_v = F.cosine_similarity(pv, tv, dim=-1)
+                                per_v = 1.0 - cos_v
+                                per_v = torch.where(valid_v, per_v,
+                                                    torch.zeros_like(per_v))
+                                val_loss += per_v.mean().item()
+                            else:
+                                val_loss += (pv - tv).pow(2).flatten(1).sum(-1).mean().item()
                             val_batches += 1
                     avg_val = val_loss / max(val_batches, 1)
                     epoch_val_losses.append(avg_val)
@@ -688,6 +749,8 @@ def main(config: DictConfig):
     # --- 7. Save final ---
     final_meta = {
         "problem": problem_name,
+        "arch": arch,
+        "loss_type": loss_type,
         "train_pct": train_pct,
         "target_mode": target_mode,
         "normalize_target": normalize_target,

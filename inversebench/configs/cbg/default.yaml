@@ -1,6 +1,9 @@
 # CBG (Classifier-Based Guidance) training defaults
 
-# Architecture
+# Architecture selection: "unet" (MeasurementPredictor) or "transformer" (TransformerCBG)
+arch: transformer
+
+# UNet architecture (used when arch=unet)
 base_channels: 64
 channel_mult: [1, 2, 4, 4]
 emb_dim: 256
@@ -9,6 +12,16 @@ y_channels: 4  # spatial channels for MeasurementEncoder (non-image obs)
 decoder_hidden: 2048  # hidden dim for MeasurementDecoder (residual MLP + LeakyReLU)
 num_res_blocks: 1     # ResBlocks per encoder/decoder level (2 = deeper)
 num_tokens: 0         # cross-attention tokens (0 = off, 64 = recommended)
+
+# Transformer architecture (used when arch=transformer)
+embed_dim: 256
+num_layers: 4
+num_heads: 4
+ffn_mult: 2
+
+# Loss: "mse" or "cosine"
+loss_type: cosine
+cosine_eps: 1e-6
 
 # Training
 lr: 1e-4
@@ -34,7 +47,7 @@ val_fraction: 0.1
 
 # Target
 target_mode: tweedie    # "tweedie" or "direct"
-normalize_target: true
+normalize_target: false  # cosine loss handles scale-invariance
 
 # Output
 save_dir: exps/cbg
