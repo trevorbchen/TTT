@@ -551,17 +551,20 @@ def main(config: DictConfig):
     running_rel = 0.0
     running_count = 0
 
-    for pass_num in range(1, num_passes + 1):
-        # Build all (sample_idx, sigma_batch_start) pairs and shuffle
-        sig_starts = list(range(0, n_sigmas, sigma_batch_size))
-        pairs = [(i, s) for i in range(n_train) for s in sig_starts]
-        np.random.shuffle(pairs)
+    # Build ALL (sample_idx, sigma_batch_start) pairs across all passes
+    # and shuffle into one giant pool — maximum independence (star-shaped).
+    sig_starts = list(range(0, n_sigmas, sigma_batch_size))
+    all_pairs = [(i, s) for _ in range(num_passes)
+                 for i in range(n_train) for s in sig_starts]
+    np.random.shuffle(all_pairs)
 
-        classifier.train()
-        t_pass = time.time()
+    classifier.train()
+    t_pass = time.time()
 
-        pbar = tqdm.tqdm(pairs,
-                         desc=f"Pass {pass_num}/{num_passes}")
+    pbar = tqdm.tqdm(all_pairs, desc="Training")
+
+    if True:  # keep indentation level for minimal diff
+        pairs = all_pairs
 
         for (i, sig_start) in pbar:
                 x0 = images[i:i+1]
@@ -736,14 +739,14 @@ def main(config: DictConfig):
 
                 # Progress update
                 logger.update_progress(
-                    status="training", epoch=pass_num,
+                    status="training",
                     step=global_step, train_loss=loss_val,
                     best_val_loss=best_val_loss)
 
-        pbar.close()
-        pass_time = time.time() - t_pass
-        logger.log(f"Pass {pass_num} complete in {pass_time:.0f}s "
-                   f"({global_step} total steps)")
+    pbar.close()
+    total_time = time.time() - t_pass
+    logger.log(f"Training complete in {total_time:.0f}s "
+               f"({global_step} total steps)")
 
     # Final loss curve
     save_loss_curves(step_losses, epoch_train_losses,
