@@ -30,9 +30,13 @@ from scipy import stats
 
 import sys
 _repo_root = str(Path(__file__).resolve().parent)
-_project_root = str(Path(__file__).resolve().parent.parent)
-for p in [_repo_root, _project_root]:
-    if p not in sys.path:
+# When running from TTT/inversebench/, parent is TTT/ (has sampler.py).
+# When running from InverseBench/ (ML7 deployment), parent is ttt/ and
+# sampler.py is at ttt/TTT/sampler.py — so also add parent/TTT.
+_parent = Path(__file__).resolve().parent.parent
+_possible_roots = [str(_parent), str(_parent / "TTT")]
+for p in [_repo_root] + _possible_roots:
+    if p not in sys.path and Path(p).is_dir():
         sys.path.insert(0, p)
 
 from classifier import load_classifier
