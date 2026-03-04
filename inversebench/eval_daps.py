@@ -154,25 +154,22 @@ def daps_sample(net, operator, observation, scheduler, device='cuda',
         sigma_t = torch.as_tensor(sigma, device=device)
 
         # --- 1. Reverse diffusion: denoise x_t → x0_hat ---
-        # Mini PF-ODE from sigma down to ~0
+        # Use InverseBench VP Scheduler for proper PF-ODE
         with torch.no_grad():
-            sub_sigmas = torch.linspace(
-                np.log(sigma), np.log(max(sigma_min * 0.1, 0.002)),
-                diffusion_substeps + 1
-            ).exp().tolist()
-
+            sub_sched = Scheduler(num_steps=diffusion_substeps, schedule="vp",
+                                  timestep="vp", scaling="vp",
+                                  sigma_max=sigma)
             x = x_t.clone()
-            for s_idx in range(diffusion_substeps):
-                s_cur = sub_sigmas[s_idx]
-                s_next = sub_sigmas[s_idx + 1]
-                s_t = torch.as_tensor(s_cur, device=device)
+            for s_idx in range(sub_sched.num_steps):
+                s_sigma = sub_sched.sigma_steps[s_idx]
+                s_scaling = sub_sched.scaling_steps[s_idx]
+                s_factor = sub_sched.factor_steps[s_idx]
+                s_sf = sub_sched.scaling_factor[s_idx]
+                s_t = torch.as_tensor(s_sigma, device=device)
 
-                # VP scaling
-                scaling = 1.0 / np.sqrt(1.0 + s_cur ** 2)
-                denoised = net(x / scaling, s_t)
-                score = (denoised - x / scaling) / s_cur ** 2 / scaling
-                # Euler step in sigma space
-                x = x + (s_next - s_cur) * (-score * s_cur)
+                denoised = net(x / s_scaling, s_t)
+                score = (denoised - x / s_scaling) / s_sigma ** 2 / s_scaling
+                x = x * s_sf + s_factor * score * 0.5
 
             x0_hat = x
 
@@ -182,9 +179,7 @@ def daps_sample(net, operator, observation, scheduler, device='cuda',
         lr = mcmc_lr * ((1.0 + ratio * (lr_min_ratio ** 1.0 - 1.0)) ** 1.0)
 
         # Prior score: Gaussian p(x0 | xt) ~ N(x0_hat, sigma^2 I)
-        # => nabla log p(x0 | xt) = (x0_hat - x0) / sigma^2
-        # But we also have xt term: (xt - x0) / sigma^2
-        # Combined prior: precompute once
+        # precompute: nabla log p(x0 | xt) has a fixed part from x0_hat
         x0 = x0_hat.clone().detach()
         prior_score = (x0_hat.detach() - x_t.detach()) / sigma ** 2
 
@@ -193,7 +188,7 @@ def daps_sample(net, operator, observation, scheduler, device='cuda',
             data_grad, data_loss = operator.gradient(x0, obs, return_loss=True)
             data_term = -data_grad / tau ** 2
 
-            # Prior term: (x0_hat - x0) / sigma^2 + (xt - x0) / sigma^2
+            # Prior term: (xt - x0) / sigma^2 + precomputed prior_score
             xt_term = (x_t.detach() - x0) / sigma ** 2
 
             cur_score = data_term + xt_term + prior_score
