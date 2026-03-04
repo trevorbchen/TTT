@@ -153,25 +153,11 @@ def daps_sample(net, operator, observation, scheduler, device='cuda',
         sigma_next = sigmas[step + 1] if step < num_annealing_steps - 1 else 0.0
         sigma_t = torch.as_tensor(sigma, device=device)
 
-        # --- 1. Reverse diffusion: denoise x_t → x0_hat ---
-        # Use InverseBench VP Scheduler for proper PF-ODE
+        # --- 1. Tweedie denoising: x_t → x0_hat ---
+        # Single-step Tweedie estimate; MCMC will refine
         with torch.no_grad():
-            sub_sched = Scheduler(num_steps=diffusion_substeps, schedule="vp",
-                                  timestep="vp", scaling="vp",
-                                  sigma_max=sigma)
-            x = x_t.clone()
-            for s_idx in range(sub_sched.num_steps):
-                s_sigma = sub_sched.sigma_steps[s_idx]
-                s_scaling = sub_sched.scaling_steps[s_idx]
-                s_factor = sub_sched.factor_steps[s_idx]
-                s_sf = sub_sched.scaling_factor[s_idx]
-                s_t = torch.as_tensor(s_sigma, device=device)
-
-                denoised = net(x / s_scaling, s_t)
-                score = (denoised - x / s_scaling) / s_sigma ** 2 / s_scaling
-                x = x * s_sf + s_factor * score * 0.5
-
-            x0_hat = x
+            scaling = 1.0 / np.sqrt(1.0 + sigma ** 2)  # VP scaling
+            x0_hat = net(x_t / scaling, sigma_t)
 
         # --- 2. MCMC (Langevin) at x0 level ---
         # LR schedule: decays over annealing steps
