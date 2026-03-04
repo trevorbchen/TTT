@@ -67,11 +67,22 @@ def confidence_interval_95(values):
 # CBG sampling (adapted from ttt_cbg.py)
 # ---------------------------------------------------------------------------
 
-@torch.no_grad()
 def cbg_sample(net, classifier, forward_op, observation, scheduler,
-               guidance_scale=1.0, device='cuda'):
-    """Single-sample CBG reconstruction using PF-ODE Euler + classifier guidance."""
+               guidance_scale=1.0, device='cuda', target_mode='tweedie'):
+    """Single-sample CBG reconstruction using PF-ODE Euler + classifier guidance.
+
+    For forward mode: gradient flows through the diffusion model (like DPS)
+    but uses the classifier as a differentiable surrogate for the forward
+    operator A.  This gives meaningful gradients w.r.t. x_t.
+    """
     obs = observation  # [1, ...]
+
+    # Precompute flat y for forward-mode guidance
+    if target_mode == "forward":
+        if obs.is_complex():
+            y_flat = torch.view_as_real(obs).flatten(1).float()
+        else:
+            y_flat = obs.flatten(1).float()
 
     # Initial noise
     x = torch.randn(
@@ -84,34 +95,141 @@ def cbg_sample(net, classifier, forward_op, observation, scheduler,
         scaling = scheduler.scaling_steps[i]
         factor = scheduler.factor_steps[i]
         scaling_factor = scheduler.scaling_factor[i]
+        sigma_t = torch.as_tensor(sigma).to(device)
 
-        # 1. Tweedie denoising (no grad)
-        denoised = net(x / scaling, torch.as_tensor(sigma).to(device))
-
-        # 2. Classifier gradient (grad only through small network)
-        with torch.enable_grad():
+        if target_mode == "forward":
+            # Gradient flows through diffusion model → classifier
+            # (like DPS, but classifier replaces A)
             x_in = x.detach().requires_grad_(True)
-            pred_residual = classifier(
-                x_in / scaling,
-                torch.as_tensor(sigma).to(device),
-                obs)
-            loss_val = pred_residual.pow(2).flatten(1).sum(-1)
+            net.requires_grad_(True)
+            denoised = net(x_in / scaling, sigma_t)
+
+            pred = classifier(
+                x_in / scaling, sigma_t, None,
+                denoised=denoised)
+            loss_val = (pred.flatten(1) - y_flat).pow(2).sum(-1)
             grad_x = torch.autograd.grad(loss_val.sum(), x_in)[0]
 
-        # 3. Per-sample normalization
-        norm_factor = loss_val.sqrt().view(-1, *([1] * (grad_x.ndim - 1)))
-        norm_factor = norm_factor.clamp(min=1e-8)
-        normalized_grad = grad_x / norm_factor
+            net.requires_grad_(False)
 
-        # 4. PF-ODE Euler step
-        score = (denoised - x / scaling) / sigma ** 2 / scaling
-        x = x * scaling_factor + factor * score * 0.5
+            # Recompute denoised cleanly for the ODE step
+            with torch.no_grad():
+                denoised_clean = net(x / scaling, sigma_t)
+        else:
+            # Legacy mode: grad only through classifier (no diffusion model)
+            with torch.no_grad():
+                denoised = net(x / scaling, sigma_t)
 
-        # Apply guidance
-        x = x - guidance_scale * normalized_grad
+            with torch.enable_grad():
+                x_in = x.detach().requires_grad_(True)
+                pred = classifier(
+                    x_in / scaling, sigma_t, obs,
+                    denoised=denoised)
+                if getattr(classifier, 'scalar_output', False):
+                    loss_val = pred.squeeze(-1)
+                else:
+                    loss_val = pred.pow(2).flatten(1).sum(-1)
+                grad_x = torch.autograd.grad(loss_val.sum(), x_in)[0]
 
-        if torch.isnan(x).any():
-            break
+            denoised_clean = denoised
+
+        # Per-sample normalization
+        with torch.no_grad():
+            norm_factor = loss_val.sqrt().view(-1, *([1] * (grad_x.ndim - 1)))
+            norm_factor = norm_factor.clamp(min=1e-8)
+            normalized_grad = grad_x / norm_factor
+
+            # PF-ODE Euler step
+            score = (denoised_clean - x / scaling) / sigma ** 2 / scaling
+            x = x * scaling_factor + factor * score * 0.5
+
+            # Apply guidance
+            x = x - guidance_scale * normalized_grad
+
+            if torch.isnan(x).any():
+                break
+
+    return x
+
+
+# ---------------------------------------------------------------------------
+# Hybrid sampling: surrogate early, DPS late
+# ---------------------------------------------------------------------------
+
+def hybrid_sample(net, classifier, forward_op, observation, scheduler,
+                  guidance_scale=1.0, device='cuda', target_mode='forward',
+                  switch_sigma=12.0):
+    """Hybrid reconstruction: surrogate for high-sigma steps, DPS for low-sigma.
+
+    Uses the classifier as a cheap differentiable surrogate for A while sigma
+    is large (gradients align well with DPS there).  Once sigma drops below
+    ``switch_sigma``, switches to the true forward operator (DPS-style) for
+    the remaining steps where fine-grained guidance matters.
+    """
+    obs = observation  # [1, ...]
+
+    # Precompute flat y for surrogate guidance
+    if obs.is_complex():
+        y_flat = torch.view_as_real(obs).flatten(1).float()
+    else:
+        y_flat = obs.flatten(1).float()
+
+    # Initial noise
+    x = torch.randn(
+        1, net.img_channels, net.img_resolution, net.img_resolution,
+        device=device
+    ) * scheduler.sigma_max
+
+    switched = False
+    for i in range(scheduler.num_steps):
+        sigma = scheduler.sigma_steps[i]
+        scaling = scheduler.scaling_steps[i]
+        factor = scheduler.factor_steps[i]
+        scaling_factor = scheduler.scaling_factor[i]
+        sigma_t = torch.as_tensor(sigma).to(device)
+
+        use_dps = (float(sigma) < switch_sigma)
+        if use_dps and not switched:
+            switched = True
+
+        # Gradient through diffusion model in both cases
+        x_in = x.detach().requires_grad_(True)
+        net.requires_grad_(True)
+        denoised = net(x_in / scaling, sigma_t)
+
+        if use_dps:
+            # DPS: true forward operator
+            y_hat = forward_op({'target': denoised})
+            residual = y_hat - obs
+            if residual.is_complex():
+                loss_val = torch.view_as_real(residual).pow(2).flatten(1).sum(-1)
+            else:
+                loss_val = residual.pow(2).flatten(1).sum(-1)
+        else:
+            # Surrogate: classifier replaces A
+            pred = classifier(
+                x_in / scaling, sigma_t, None,
+                denoised=denoised)
+            loss_val = (pred.flatten(1) - y_flat).pow(2).sum(-1)
+
+        grad_x = torch.autograd.grad(loss_val.sum(), x_in)[0]
+        net.requires_grad_(False)
+
+        # Recompute denoised cleanly for ODE step
+        with torch.no_grad():
+            denoised_clean = net(x / scaling, sigma_t)
+
+            norm_factor = loss_val.sqrt().view(-1, *([1] * (grad_x.ndim - 1)))
+            norm_factor = norm_factor.clamp(min=1e-8)
+            normalized_grad = grad_x / norm_factor
+
+            # PF-ODE Euler step
+            score = (denoised_clean - x / scaling) / sigma ** 2 / scaling
+            x = x * scaling_factor + factor * score * 0.5
+            x = x - guidance_scale * normalized_grad
+
+            if torch.isnan(x).any():
+                break
 
     return x
 
@@ -219,6 +337,8 @@ def main(config: DictConfig):
     run_dps = ev.get("run_dps", True)
     dps_guidance_scale = ev.get("dps_guidance_scale", 1.0)
     run_plain = ev.get("run_plain", False)
+    run_hybrid = ev.get("run_hybrid", False)
+    hybrid_switch_sigma = ev.get("hybrid_switch_sigma", 12.0)
     save_images = ev.get("save_images", False)
     num_vis = ev.get("num_vis", 8)
     out_dir = Path(ev.get("out_dir", "exps/eval"))
@@ -235,6 +355,7 @@ def main(config: DictConfig):
     print(f"  run_dps: {run_dps}")
     print(f"  dps_guidance_scale: {dps_guidance_scale}")
     print(f"  run_plain: {run_plain}")
+    print(f"  run_hybrid: {run_hybrid} (switch_sigma={hybrid_switch_sigma})")
     print(f"  save_images: {save_images} (num_vis={num_vis})")
     print(f"  out_dir: {out_dir}")
     print()
@@ -271,6 +392,12 @@ def main(config: DictConfig):
     classifier.eval()
     num_params = sum(p.numel() for p in classifier.parameters())
     print(f"  Classifier: {num_params/1e6:.2f}M params")
+
+    # Load target_mode from checkpoint metadata (default: tweedie for backward compat)
+    ckpt_meta = torch.load(classifier_path, map_location='cpu', weights_only=False)
+    target_mode = ckpt_meta.get("target_mode", "tweedie")
+    print(f"  Target mode: {target_mode}")
+    del ckpt_meta
 
     # --- Build scheduler ---
     sched_cfg = {"num_steps": num_steps, "schedule": "vp",
@@ -321,7 +448,8 @@ def main(config: DictConfig):
         # Seed for reproducibility (same noise for CBG and DPS)
         torch.manual_seed(42 + idx)
         recon = cbg_sample(net, classifier, forward_op, y_i, scheduler,
-                           guidance_scale=guidance_scale, device=device)
+                           guidance_scale=guidance_scale, device=device,
+                           target_mode=target_mode)
 
         loss = forward_op.loss(recon, y_i).item()
         cbg_losses.append(loss)
@@ -411,12 +539,51 @@ def main(config: DictConfig):
         print(f"  Time: {plain_time:.1f}s total, "
               f"{plain_time/len(test_indices):.2f}s/sample")
 
+    # --- Hybrid evaluation ---
+    if run_hybrid:
+        print(f"\n{'='*60}")
+        print(f"Running Hybrid sampling ({len(test_indices)} samples, {num_steps} steps)")
+        print(f"  Surrogate for sigma >= {hybrid_switch_sigma}, DPS for sigma < {hybrid_switch_sigma}")
+        print(f"{'='*60}")
+
+        hybrid_losses = []
+        if save_images:
+            vis_recons['Hybrid'] = []
+        hybrid_t0 = time.time()
+        for idx in tqdm.trange(len(test_indices), desc="Hybrid"):
+            y_i = test_measurements[idx:idx+1]
+
+            torch.manual_seed(42 + idx)
+            recon = hybrid_sample(net, classifier, forward_op, y_i, scheduler,
+                                  guidance_scale=guidance_scale, device=device,
+                                  target_mode=target_mode,
+                                  switch_sigma=hybrid_switch_sigma)
+
+            loss = forward_op.loss(recon, y_i).item()
+            hybrid_losses.append(loss)
+            if save_images and idx < num_vis:
+                vis_recons['Hybrid'].append(recon.cpu())
+
+        hybrid_time = time.time() - hybrid_t0
+        hybrid_mean, hybrid_ci, hybrid_std = confidence_interval_95(hybrid_losses)
+        results['hybrid'] = {
+            'mean': hybrid_mean, 'std': hybrid_std, 'ci95_half_width': hybrid_ci,
+            'per_sample': hybrid_losses, 'total_time_sec': hybrid_time,
+            'time_per_sample_sec': hybrid_time / len(test_indices),
+            'guidance_scale': guidance_scale,
+            'switch_sigma': hybrid_switch_sigma,
+        }
+        print(f"\nHybrid: mean={hybrid_mean:.6f} +/- {hybrid_ci:.6f} "
+              f"(std={hybrid_std:.6f}, n={len(hybrid_losses)})")
+        print(f"  Time: {hybrid_time:.1f}s total, "
+              f"{hybrid_time/len(test_indices):.2f}s/sample")
+
     # --- Save reconstruction grid ---
     if save_images and vis_recons:
         n_vis = min(num_vis, len(test_indices))
         # Build column list: GT + each method
         cols = [("GT", [test_images[i:i+1].cpu() for i in range(n_vis)], None)]
-        for method_name in ['CBG', 'DPS', 'Plain']:
+        for method_name in ['CBG', 'Hybrid', 'DPS', 'Plain']:
             if method_name in vis_recons:
                 method_losses = results.get(method_name.lower(), {}).get('per_sample', [])
                 cols.append((method_name, vis_recons[method_name], method_losses[:n_vis]))
@@ -440,6 +607,8 @@ def main(config: DictConfig):
 
         # Summary title
         parts = [f"CBG={cbg_mean:.4f}"]
+        if run_hybrid:
+            parts.append(f"Hybrid={hybrid_mean:.4f}")
         if run_dps:
             parts.append(f"DPS={dps_mean:.4f}")
         if run_plain:
@@ -459,6 +628,8 @@ def main(config: DictConfig):
         'guidance_scale': guidance_scale,
         'dps_guidance_scale': dps_guidance_scale,
         'run_plain': run_plain,
+        'run_hybrid': run_hybrid,
+        'hybrid_switch_sigma': hybrid_switch_sigma,
         'save_images': save_images,
     }
 
@@ -473,6 +644,10 @@ def main(config: DictConfig):
     print(f"{'CBG':<10} {cbg_mean:>12.6f} {cbg_std:>12.6f} "
           f"{'['+f'{cbg_mean-cbg_ci:.4f}, {cbg_mean+cbg_ci:.4f}'+']':>18} "
           f"{cbg_time/len(test_indices):>12.2f}s")
+    if run_hybrid:
+        print(f"{'Hybrid':<10} {hybrid_mean:>12.6f} {hybrid_std:>12.6f} "
+              f"{'['+f'{hybrid_mean-hybrid_ci:.4f}, {hybrid_mean+hybrid_ci:.4f}'+']':>18} "
+              f"{hybrid_time/len(test_indices):>12.2f}s")
     if run_dps:
         print(f"{'DPS':<10} {dps_mean:>12.6f} {dps_std:>12.6f} "
               f"{'['+f'{dps_mean-dps_ci:.4f}, {dps_mean+dps_ci:.4f}'+']':>18} "
@@ -484,6 +659,9 @@ def main(config: DictConfig):
     if run_dps:
         speedup = dps_time / max(cbg_time, 1e-6)
         print(f"\nCBG is {speedup:.1f}x faster than DPS per sample")
+        if run_hybrid:
+            speedup_h = dps_time / max(hybrid_time, 1e-6)
+            print(f"Hybrid is {speedup_h:.1f}x faster than DPS per sample")
     print(f"{'='*60}")
 
 
