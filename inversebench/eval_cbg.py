@@ -7,7 +7,7 @@ Euler with the same noise seeds, same test samples, and same number of
 diffusion steps.
 
 Reports per-method:
-  - Mean L2 measurement error (||A(recon) - y||^2)
+  - Relative measurement error: ||A(recon) - y||_2 / ||y||_2 * 100 (%)
   - Std, 95% CI via Student-t
   - Timing
 
@@ -61,6 +61,22 @@ def confidence_interval_95(values):
         return mean, 0.0, std
     half_width = stats.t.ppf(0.975, df=n - 1) * std / np.sqrt(n)
     return float(mean), float(half_width), float(std)
+
+
+def relative_measurement_error(forward_op, recon, y):
+    """||A(recon) - y||_2 / ||y||_2 * 100  (percentage)."""
+    with torch.no_grad():
+        y_hat = forward_op({'target': recon})
+        residual = y_hat - y
+        if residual.is_complex():
+            res_norm = torch.view_as_real(residual).pow(2).flatten(1).sum(-1).sqrt()
+        else:
+            res_norm = residual.pow(2).flatten(1).sum(-1).sqrt()
+        if y.is_complex():
+            y_norm = torch.view_as_real(y).pow(2).flatten(1).sum(-1).sqrt()
+        else:
+            y_norm = y.pow(2).flatten(1).sum(-1).sqrt()
+        return (res_norm / y_norm.clamp(min=1e-8) * 100).item()
 
 
 # ---------------------------------------------------------------------------
@@ -451,8 +467,8 @@ def main(config: DictConfig):
                            guidance_scale=guidance_scale, device=device,
                            target_mode=target_mode)
 
-        loss = forward_op.loss(recon, y_i).item()
-        cbg_losses.append(loss)
+        err = relative_measurement_error(forward_op, recon, y_i)
+        cbg_losses.append(err)
         if save_images and idx < num_vis:
             vis_recons['CBG'].append(recon.cpu())
 
@@ -487,8 +503,8 @@ def main(config: DictConfig):
             recon = dps_sample(net, forward_op, y_i, scheduler,
                                guidance_scale=dps_guidance_scale, device=device)
 
-            loss = forward_op.loss(recon, y_i).item()
-            dps_losses.append(loss)
+            err = relative_measurement_error(forward_op, recon, y_i)
+            dps_losses.append(err)
             if save_images and idx < num_vis:
                 vis_recons['DPS'].append(recon.cpu())
 
@@ -522,8 +538,8 @@ def main(config: DictConfig):
             torch.manual_seed(42 + idx)
             recon = plain_sample(net, scheduler, device=device)
 
-            loss = forward_op.loss(recon, y_i).item()
-            plain_losses.append(loss)
+            err = relative_measurement_error(forward_op, recon, y_i)
+            plain_losses.append(err)
             if save_images and idx < num_vis:
                 vis_recons['Plain'].append(recon.cpu())
 
@@ -559,8 +575,8 @@ def main(config: DictConfig):
                                   target_mode=target_mode,
                                   switch_sigma=hybrid_switch_sigma)
 
-            loss = forward_op.loss(recon, y_i).item()
-            hybrid_losses.append(loss)
+            err = relative_measurement_error(forward_op, recon, y_i)
+            hybrid_losses.append(err)
             if save_images and idx < num_vis:
                 vis_recons['Hybrid'].append(recon.cpu())
 
@@ -600,19 +616,20 @@ def main(config: DictConfig):
                 img = recons_list[i].squeeze().numpy()
                 ax.imshow(img, cmap='viridis')
                 if losses is not None and i < len(losses):
-                    ax.set_title(f"{label} (L2={losses[i]:.3f})", fontsize=10)
+                    ax.set_title(f"{label} ({losses[i]:.1f}%)", fontsize=10)
                 else:
                     ax.set_title(f"{label} #{test_indices[i]}", fontsize=10)
                 ax.axis('off')
 
         # Summary title
-        parts = [f"CBG={cbg_mean:.4f}"]
+        parts = ["Rel. Meas. Error (%)"]
+        parts.append(f"CBG={cbg_mean:.1f}%")
         if run_hybrid:
-            parts.append(f"Hybrid={hybrid_mean:.4f}")
+            parts.append(f"Hybrid={hybrid_mean:.1f}%")
         if run_dps:
-            parts.append(f"DPS={dps_mean:.4f}")
+            parts.append(f"DPS={dps_mean:.1f}%")
         if run_plain:
-            parts.append(f"Plain={plain_mean:.4f}")
+            parts.append(f"Plain={plain_mean:.1f}%")
         plt.suptitle(" | ".join(parts), fontsize=13, fontweight='bold')
         plt.tight_layout()
         img_path = out_dir / "reconstructions.png"
@@ -639,22 +656,22 @@ def main(config: DictConfig):
 
     # --- Comparison table ---
     print(f"\n{'='*60}")
-    print(f"{'Method':<10} {'Mean L2':>12} {'Std':>12} {'95% CI':>18} {'Time/sample':>14}")
-    print(f"{'-'*66}")
-    print(f"{'CBG':<10} {cbg_mean:>12.6f} {cbg_std:>12.6f} "
-          f"{'['+f'{cbg_mean-cbg_ci:.4f}, {cbg_mean+cbg_ci:.4f}'+']':>18} "
+    print(f"{'Method':<10} {'Err(%)':>10} {'Std':>10} {'95% CI':>18} {'Time/sample':>14}")
+    print(f"{'-'*62}")
+    print(f"{'CBG':<10} {cbg_mean:>10.2f} {cbg_std:>10.2f} "
+          f"{'['+f'{cbg_mean-cbg_ci:.2f}, {cbg_mean+cbg_ci:.2f}'+']':>18} "
           f"{cbg_time/len(test_indices):>12.2f}s")
     if run_hybrid:
-        print(f"{'Hybrid':<10} {hybrid_mean:>12.6f} {hybrid_std:>12.6f} "
-              f"{'['+f'{hybrid_mean-hybrid_ci:.4f}, {hybrid_mean+hybrid_ci:.4f}'+']':>18} "
+        print(f"{'Hybrid':<10} {hybrid_mean:>10.2f} {hybrid_std:>10.2f} "
+              f"{'['+f'{hybrid_mean-hybrid_ci:.2f}, {hybrid_mean+hybrid_ci:.2f}'+']':>18} "
               f"{hybrid_time/len(test_indices):>12.2f}s")
     if run_dps:
-        print(f"{'DPS':<10} {dps_mean:>12.6f} {dps_std:>12.6f} "
-              f"{'['+f'{dps_mean-dps_ci:.4f}, {dps_mean+dps_ci:.4f}'+']':>18} "
+        print(f"{'DPS':<10} {dps_mean:>10.2f} {dps_std:>10.2f} "
+              f"{'['+f'{dps_mean-dps_ci:.2f}, {dps_mean+dps_ci:.2f}'+']':>18} "
               f"{dps_time/len(test_indices):>12.2f}s")
     if run_plain:
-        print(f"{'Plain':<10} {plain_mean:>12.6f} {plain_std:>12.6f} "
-              f"{'['+f'{plain_mean-plain_ci:.4f}, {plain_mean+plain_ci:.4f}'+']':>18} "
+        print(f"{'Plain':<10} {plain_mean:>10.2f} {plain_std:>10.2f} "
+              f"{'['+f'{plain_mean-plain_ci:.2f}, {plain_mean+plain_ci:.2f}'+']':>18} "
               f"{plain_time/len(test_indices):>12.2f}s")
     if run_dps:
         speedup = dps_time / max(cbg_time, 1e-6)

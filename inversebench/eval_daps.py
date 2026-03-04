@@ -60,6 +60,22 @@ def confidence_interval_95(values):
     return float(mean), float(half_width), float(std)
 
 
+def relative_measurement_error(forward_op, recon, y):
+    """||A(recon) - y||_2 / ||y||_2 * 100  (percentage)."""
+    with torch.no_grad():
+        y_hat = forward_op({'target': recon})
+        residual = y_hat - y
+        if residual.is_complex():
+            res_norm = torch.view_as_real(residual).pow(2).flatten(1).sum(-1).sqrt()
+        else:
+            res_norm = residual.pow(2).flatten(1).sum(-1).sqrt()
+        if y.is_complex():
+            y_norm = torch.view_as_real(y).pow(2).flatten(1).sum(-1).sqrt()
+        else:
+            y_norm = y.pow(2).flatten(1).sum(-1).sqrt()
+        return (res_norm / y_norm.clamp(min=1e-8) * 100).item()
+
+
 # ---------------------------------------------------------------------------
 # Model wrapper: InverseBench EDMPrecond → DAPS model interface
 # ---------------------------------------------------------------------------
@@ -310,9 +326,8 @@ def main(config: DictConfig):
             torch.manual_seed(42 + idx)
             x_start = daps.get_start(1, model)
             recon = daps.sample(model, x_start, true_op, y_i)
-            with torch.no_grad():
-                loss = forward_op.loss(recon, y_i).item()
-            true_losses.append(loss)
+            err = relative_measurement_error(forward_op, recon, y_i)
+            true_losses.append(err)
             if save_images and idx < num_vis:
                 vis_recons['DAPS-True'].append(recon.detach().cpu())
 
@@ -343,9 +358,8 @@ def main(config: DictConfig):
             torch.manual_seed(42 + idx)
             x_start = daps.get_start(1, model)
             recon = daps.sample(model, x_start, surrogate_op, y_i)
-            with torch.no_grad():
-                loss = forward_op.loss(recon, y_i).item()
-            surr_losses.append(loss)
+            err = relative_measurement_error(forward_op, recon, y_i)
+            surr_losses.append(err)
             if save_images and idx < num_vis:
                 vis_recons['DAPS-Surr'].append(recon.detach().cpu())
 
@@ -380,16 +394,16 @@ def main(config: DictConfig):
 
     # --- Comparison table ---
     print(f"\n{'='*60}")
-    print(f"{'Method':<15} {'Mean L2':>12} {'Std':>12} "
+    print(f"{'Method':<15} {'Err(%)':>10} {'Std':>10} "
           f"{'95% CI':>18} {'Time/sample':>14}")
-    print(f"{'-'*71}")
+    print(f"{'-'*67}")
     if run_true:
-        print(f"{'DAPS-True':<15} {true_mean:>12.6f} {true_std:>12.6f} "
-              f"{'['+f'{true_mean-true_ci:.4f}, {true_mean+true_ci:.4f}'+']':>18} "
+        print(f"{'DAPS-True':<15} {true_mean:>10.2f} {true_std:>10.2f} "
+              f"{'['+f'{true_mean-true_ci:.2f}, {true_mean+true_ci:.2f}'+']':>18} "
               f"{true_time/len(test_indices):>12.2f}s")
     if run_surrogate:
-        print(f"{'DAPS-Surr':<15} {surr_mean:>12.6f} {surr_std:>12.6f} "
-              f"{'['+f'{surr_mean-surr_ci:.4f}, {surr_mean+surr_ci:.4f}'+']':>18} "
+        print(f"{'DAPS-Surr':<15} {surr_mean:>10.2f} {surr_std:>10.2f} "
+              f"{'['+f'{surr_mean-surr_ci:.2f}, {surr_mean+surr_ci:.2f}'+']':>18} "
               f"{surr_time/len(test_indices):>12.2f}s")
     if run_true and run_surrogate:
         speedup = true_time / max(surr_time, 1e-6)
@@ -423,18 +437,18 @@ def main(config: DictConfig):
                 img = recons_list[i].squeeze().numpy()
                 ax.imshow(img, cmap='viridis')
                 if losses is not None and i < len(losses):
-                    ax.set_title(f"{label} (L2={losses[i]:.3f})",
+                    ax.set_title(f"{label} ({losses[i]:.1f}%)",
                                  fontsize=10)
                 else:
                     ax.set_title(f"{label} #{test_indices[i]}",
                                  fontsize=10)
                 ax.axis('off')
 
-        parts = []
+        parts = ["Rel. Meas. Error (%)"]
         if run_true:
-            parts.append(f"True={true_mean:.4f}")
+            parts.append(f"True={true_mean:.1f}%")
         if run_surrogate:
-            parts.append(f"Surr={surr_mean:.4f}")
+            parts.append(f"Surr={surr_mean:.1f}%")
         plt.suptitle(" | ".join(parts), fontsize=13, fontweight='bold')
         plt.tight_layout()
         img_path = out_dir / "reconstructions.png"
