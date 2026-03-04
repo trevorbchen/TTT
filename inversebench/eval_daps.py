@@ -1,10 +1,10 @@
 """
 DAPS evaluation: compare DAPS with true operator vs DAPS with surrogate.
 
-Uses the existing DAPS infrastructure (sampler.py, cores/mcmc.py,
-cores/scheduler.py) with thin wrappers around InverseBench components.
+Uses InverseBench's own algo/daps.py (same code as the paper's results)
+with the paper's tuned hyperparameters for inverse scattering (Table 12).
 
-DAPS runs MCMC at x0 level, so the surrogate gradient is just
+DAPS runs Langevin dynamics at x0 level, so the surrogate gradient is just
 nabla_{x0} ||surrogate(x0) - y||^2 — NO diffusion model backprop needed.
 
 Usage:
@@ -30,23 +30,16 @@ from scipy import stats
 
 import sys
 _repo_root = str(Path(__file__).resolve().parent)
-# When running from TTT/inversebench/, parent is TTT/ (has sampler.py).
-# When running from InverseBench/ (ML7 deployment), parent is ttt/ and
-# sampler.py is at ttt/TTT/sampler.py — so also add parent/TTT.
-_parent = Path(__file__).resolve().parent.parent
-_possible_roots = [str(_parent), str(_parent / "TTT")]
-for p in [_repo_root] + _possible_roots:
-    if p not in sys.path and Path(p).is_dir():
-        sys.path.insert(0, p)
+if _repo_root not in sys.path:
+    sys.path.insert(0, _repo_root)
 
 from classifier import load_classifier
 from utils.helper import open_url
-from sampler import DAPS
-import torch.nn as nn
+from algo.daps import DAPS, LangevinDynamics
 
 
 # ---------------------------------------------------------------------------
-# Confidence interval
+# Helpers
 # ---------------------------------------------------------------------------
 
 def confidence_interval_95(values):
@@ -77,60 +70,24 @@ def relative_measurement_error(forward_op, recon, y):
 
 
 # ---------------------------------------------------------------------------
-# Model wrapper: InverseBench EDMPrecond → DAPS model interface
-# ---------------------------------------------------------------------------
-
-class ModelWrapper(nn.Module):
-    """Wraps InverseBench's EDMPrecond with the interface expected by
-    DAPS / DiffusionPFODE: .tweedie(), .score(), .get_in_shape().
-
-    With EDM scheduler (scaling=1), DiffusionPFODE passes xt directly
-    to model.tweedie(xt, sigma).  InverseBench's net expects input in
-    the form (x_0 + sigma*eps), which matches the EDM convention.
-    """
-
-    def __init__(self, net):
-        super().__init__()
-        self.net = net
-
-    def tweedie(self, x, sigma):
-        return self.net(x, torch.as_tensor(sigma).to(x.device))
-
-    def score(self, x, sigma):
-        d = self.tweedie(x, sigma)
-        return (d - x) / sigma ** 2
-
-    def get_in_shape(self):
-        return (self.net.img_channels, self.net.img_resolution,
-                self.net.img_resolution)
-
-
-# ---------------------------------------------------------------------------
-# Operator wrappers (match MCMCSampler's .gradient / .loss interface)
+# Surrogate operator (drop-in replacement for forward_op in DAPS)
 # ---------------------------------------------------------------------------
 
 class SurrogateOperator:
-    """Wraps ForwardSurrogate as a drop-in operator for MCMC.
+    """Wraps ForwardSurrogate as a drop-in for InverseBench forward_op.
 
-    gradient(x, y) only flows through the ~3M param surrogate ViT,
-    NOT through the forward operator A or the diffusion model.
+    LangevinDynamics calls operator.gradient(x, measurement) — this routes
+    the gradient through the ~3M param surrogate ViT instead of the true A.
     """
 
-    def __init__(self, classifier, obs_is_complex=False):
+    def __init__(self, classifier, device='cuda'):
         self.classifier = classifier
-        self.obs_is_complex = obs_is_complex
+        self.device = device
 
     def _flat_y(self, y):
         if y.is_complex():
             return torch.view_as_real(y).flatten(1).float()
         return y.flatten(1).float()
-
-    def loss(self, x, y):
-        """||surrogate(x) - y||^2, per sample. [B]"""
-        with torch.no_grad():
-            pred = self.classifier(x, None, None, denoised=x)
-            y_flat = self._flat_y(y)
-            return (pred.flatten(1) - y_flat).pow(2).sum(-1)
 
     def gradient(self, x, y, return_loss=False):
         """nabla_x ||surrogate(x) - y||^2"""
@@ -138,26 +95,6 @@ class SurrogateOperator:
         pred = self.classifier(x_in, None, None, denoised=x_in)
         y_flat = self._flat_y(y)
         loss_val = (pred.flatten(1) - y_flat).pow(2).sum(-1)
-        grad_x = torch.autograd.grad(loss_val.sum(), x_in)[0]
-        if return_loss:
-            return grad_x, loss_val
-        return grad_x
-
-
-class TrueOperatorWrapper:
-    """Wraps InverseBench forward_op with gradient/loss interface for MCMC."""
-
-    def __init__(self, forward_op):
-        self.forward_op = forward_op
-
-    def loss(self, x, y):
-        """||A(x) - y||^2, per sample. [B]"""
-        return self.forward_op.loss(x, y)
-
-    def gradient(self, x, y, return_loss=False):
-        """nabla_x ||A(x) - y||^2"""
-        x_in = x.clone().detach().requires_grad_(True)
-        loss_val = self.forward_op.loss(x_in, y)
         grad_x = torch.autograd.grad(loss_val.sum(), x_in)[0]
         if return_loss:
             return grad_x, loss_val
@@ -181,19 +118,17 @@ def main(config: DictConfig):
     out_dir = Path(ev.get("out_dir", "exps/eval_daps"))
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # DAPS hyperparams (defaults from configs/sampler/edm_daps.yaml)
+    # DAPS hyperparams — defaults from paper Table 12 (inv-scatter, 360 recv)
     num_annealing_steps = ev.get("num_annealing_steps", 200)
-    diffusion_substeps = ev.get("diffusion_substeps", 5)
+    diffusion_substeps = ev.get("diffusion_substeps", 10)
     sigma_max = ev.get("sigma_max", 100.0)
     sigma_min = ev.get("sigma_min", 0.1)
 
-    # MCMC hyperparams (defaults from configs/task/*.yaml pixel configs)
-    num_mcmc_steps = ev.get("num_mcmc_steps", 100)
-    mcmc_lr = ev.get("mcmc_lr", 5e-5)
-    tau = ev.get("tau", 0.01)
-    lr_min_ratio = ev.get("lr_min_ratio", 0.01)
-    mc_algo = ev.get("mc_algo", "langevin")
-    prior_solver = ev.get("prior_solver", "gaussian")
+    # Langevin dynamics — tuned for inv-scatter (Table 12)
+    num_lgvd_steps = ev.get("num_lgvd_steps", 50)
+    lgvd_lr = ev.get("lgvd_lr", 4e-5)
+    tau = ev.get("tau", 1e-4)
+    lr_min_ratio = ev.get("lr_min_ratio", 1.0)
 
     run_true = ev.get("run_true", True)
     run_surrogate = ev.get("run_surrogate", True)
@@ -202,16 +137,15 @@ def main(config: DictConfig):
 
     assert classifier_path, "Must provide +eval.classifier_path=..."
 
-    print("=== DAPS Evaluation (using existing DAPS infrastructure) ===")
+    print("=== DAPS Evaluation (InverseBench algo/daps.py) ===")
     print(f"  classifier:          {classifier_path}")
     print(f"  num_annealing_steps: {num_annealing_steps}")
     print(f"  diffusion_substeps:  {diffusion_substeps}")
     print(f"  sigma_max/min:       {sigma_max}/{sigma_min}")
-    print(f"  num_mcmc_steps:      {num_mcmc_steps}")
-    print(f"  mcmc_lr:             {mcmc_lr}")
+    print(f"  num_lgvd_steps:      {num_lgvd_steps}")
+    print(f"  lgvd_lr:             {lgvd_lr}")
     print(f"  tau:                 {tau}")
-    print(f"  mc_algo:             {mc_algo}")
-    print(f"  prior_solver:        {prior_solver}")
+    print(f"  lr_min_ratio:        {lr_min_ratio}")
     print(f"  num_test:            {num_test}")
     print(f"  run_true: {run_true}, run_surrogate: {run_surrogate}")
     print()
@@ -247,43 +181,33 @@ def main(config: DictConfig):
     num_params = sum(p.numel() for p in classifier.parameters())
     print(f"  Surrogate: {num_params/1e6:.2f}M params")
 
-    # --- Wrap model and operators ---
-    model = ModelWrapper(net)
-    surrogate_op = SurrogateOperator(classifier)
-    true_op = TrueOperatorWrapper(forward_op)
-
-    # --- Build DAPS sampler using existing infrastructure ---
-    annealing_scheduler_config = {
-        'name': 'edm',
+    # --- Build DAPS configs (paper Table 12 defaults for inv-scatter) ---
+    annealing_config = {
         'num_steps': num_annealing_steps,
         'sigma_max': sigma_max,
         'sigma_min': sigma_min,
+        'schedule': 'linear',
         'timestep': 'poly-7',
     }
-    diffusion_scheduler_config = {
-        'name': 'edm',
+    diffusion_config = {
         'num_steps': diffusion_substeps,
         'sigma_min': 0.01,
+        'schedule': 'linear',
         'timestep': 'poly-7',
     }
-    mcmc_sampler_config = {
-        'num_steps': num_mcmc_steps,
-        'lr': mcmc_lr,
+    lgvd_config = {
+        'num_steps': num_lgvd_steps,
+        'lr': lgvd_lr,
         'tau': tau,
         'lr_min_ratio': lr_min_ratio,
-        'mc_algo': mc_algo,
-        'prior_solver': prior_solver,
     }
 
-    daps = DAPS(annealing_scheduler_config, diffusion_scheduler_config,
-                mcmc_sampler_config)
-
-    print(f"\nDAPS sampler built:")
+    print(f"\nDAPS config (paper Table 12 defaults for inv-scatter):")
     print(f"  Annealing: {num_annealing_steps} levels, "
           f"sigma [{sigma_min}, {sigma_max}]")
     print(f"  Diffusion: {diffusion_substeps} PF-ODE steps per level")
-    print(f"  MCMC: {num_mcmc_steps} {mc_algo} steps, "
-          f"lr={mcmc_lr}, tau={tau}")
+    print(f"  Langevin:  {num_lgvd_steps} steps, "
+          f"lr={lgvd_lr}, tau={tau}, lr_min_ratio={lr_min_ratio}")
 
     # --- Select test samples ---
     N = len(test_dataset)
@@ -317,29 +241,31 @@ def main(config: DictConfig):
         print(f"DAPS with TRUE operator ({len(test_indices)} samples)")
         print(f"{'='*60}")
 
-        true_losses = []
+        daps_true = DAPS(net, forward_op, annealing_config,
+                         diffusion_config, lgvd_config)
+
+        true_errs = []
         if save_images:
             vis_recons['DAPS-True'] = []
         t0 = time.time()
         for idx in tqdm.trange(len(test_indices), desc="DAPS-True"):
             y_i = test_measurements[idx:idx+1]
             torch.manual_seed(42 + idx)
-            x_start = daps.get_start(1, model)
-            recon = daps.sample(model, x_start, true_op, y_i)
+            recon = daps_true.inference(y_i, verbose=False)
             err = relative_measurement_error(forward_op, recon, y_i)
-            true_losses.append(err)
+            true_errs.append(err)
             if save_images and idx < num_vis:
                 vis_recons['DAPS-True'].append(recon.detach().cpu())
 
         true_time = time.time() - t0
-        true_mean, true_ci, true_std = confidence_interval_95(true_losses)
+        true_mean, true_ci, true_std = confidence_interval_95(true_errs)
         results['daps_true'] = {
             'mean': true_mean, 'std': true_std, 'ci95_half_width': true_ci,
-            'per_sample': true_losses, 'total_time_sec': true_time,
+            'per_sample': true_errs, 'total_time_sec': true_time,
             'time_per_sample_sec': true_time / len(test_indices),
         }
-        print(f"\nDAPS-True: mean={true_mean:.6f} +/- {true_ci:.6f} "
-              f"(std={true_std:.6f})")
+        print(f"\nDAPS-True: mean={true_mean:.2f}% +/- {true_ci:.2f} "
+              f"(std={true_std:.2f})")
         print(f"  Time: {true_time:.1f}s total, "
               f"{true_time/len(test_indices):.2f}s/sample")
 
@@ -349,29 +275,32 @@ def main(config: DictConfig):
         print(f"DAPS with SURROGATE ({len(test_indices)} samples)")
         print(f"{'='*60}")
 
-        surr_losses = []
+        surrogate_op = SurrogateOperator(classifier, device=device)
+        daps_surr = DAPS(net, surrogate_op, annealing_config,
+                         diffusion_config, lgvd_config)
+
+        surr_errs = []
         if save_images:
             vis_recons['DAPS-Surr'] = []
         t0 = time.time()
         for idx in tqdm.trange(len(test_indices), desc="DAPS-Surr"):
             y_i = test_measurements[idx:idx+1]
             torch.manual_seed(42 + idx)
-            x_start = daps.get_start(1, model)
-            recon = daps.sample(model, x_start, surrogate_op, y_i)
+            recon = daps_surr.inference(y_i, verbose=False)
             err = relative_measurement_error(forward_op, recon, y_i)
-            surr_losses.append(err)
+            surr_errs.append(err)
             if save_images and idx < num_vis:
                 vis_recons['DAPS-Surr'].append(recon.detach().cpu())
 
         surr_time = time.time() - t0
-        surr_mean, surr_ci, surr_std = confidence_interval_95(surr_losses)
+        surr_mean, surr_ci, surr_std = confidence_interval_95(surr_errs)
         results['daps_surrogate'] = {
             'mean': surr_mean, 'std': surr_std, 'ci95_half_width': surr_ci,
-            'per_sample': surr_losses, 'total_time_sec': surr_time,
+            'per_sample': surr_errs, 'total_time_sec': surr_time,
             'time_per_sample_sec': surr_time / len(test_indices),
         }
-        print(f"\nDAPS-Surr: mean={surr_mean:.6f} +/- {surr_ci:.6f} "
-              f"(std={surr_std:.6f})")
+        print(f"\nDAPS-Surr: mean={surr_mean:.2f}% +/- {surr_ci:.2f} "
+              f"(std={surr_std:.2f})")
         print(f"  Time: {surr_time:.1f}s total, "
               f"{surr_time/len(test_indices):.2f}s/sample")
 
@@ -382,10 +311,9 @@ def main(config: DictConfig):
         'num_annealing_steps': num_annealing_steps,
         'diffusion_substeps': diffusion_substeps,
         'sigma_max': sigma_max, 'sigma_min': sigma_min,
-        'num_mcmc_steps': num_mcmc_steps,
-        'mcmc_lr': mcmc_lr, 'tau': tau,
+        'num_lgvd_steps': num_lgvd_steps,
+        'lgvd_lr': lgvd_lr, 'tau': tau,
         'lr_min_ratio': lr_min_ratio,
-        'mc_algo': mc_algo, 'prior_solver': prior_solver,
     }
 
     with open(str(out_dir / "eval_results.json"), "w") as f:
@@ -410,6 +338,7 @@ def main(config: DictConfig):
         print(f"\nSurrogate is {speedup:.1f}x "
               f"{'faster' if speedup > 1 else 'slower'} "
               f"than true operator")
+    print(f"  Paper reference (DAPS, 360 recv): 1.03% +/- 0.25")
     print(f"{'='*60}")
 
     # --- Save image grid ---
