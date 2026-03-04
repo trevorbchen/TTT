@@ -135,7 +135,9 @@ class TransformerCBG(nn.Module):
     def __init__(self, img_resolution=256, img_channels=1,
                  obs_shape=(20, 360), meas_flat_dim=14400,
                  embed_dim=256, num_layers=4, num_heads=4, ffn_mult=2,
-                 patch_size=16, dropout=0.0):
+                 patch_size=16, dropout=0.0,
+                 use_tweedie_input=False, scalar_output=False,
+                 input_norm=True, query_output=False):
         super().__init__()
         self.img_resolution = img_resolution
         self.img_channels = img_channels
@@ -147,13 +149,22 @@ class TransformerCBG(nn.Module):
         self.ffn_mult = ffn_mult
         self.patch_size = patch_size
         self.dropout = dropout
+        self.use_tweedie_input = use_tweedie_input
+        self.scalar_output = scalar_output
+        self.input_norm = input_norm
+        self.query_output = query_output
 
         # --- Image tokenization (ViT-style) ---
-        num_patches = (img_resolution // patch_size) ** 2  # e.g. 256
+        num_patches = (img_resolution // patch_size) ** 2  # e.g. 64 for 128x128
         patch_dim = img_channels * patch_size * patch_size  # e.g. 256
         self.num_patches = num_patches
         self.patch_proj = nn.Linear(patch_dim, embed_dim)
         self.patch_pos_emb = nn.Parameter(torch.randn(1, num_patches, embed_dim) * 0.02)
+
+        # --- Tweedie (denoised) image tokenization ---
+        if use_tweedie_input:
+            self.tweedie_patch_proj = nn.Linear(patch_dim, embed_dim)
+            self.tweedie_pos_emb = nn.Parameter(torch.randn(1, num_patches, embed_dim) * 0.02)
 
         # --- Measurement tokenization (per-receiver) ---
         # obs_shape = (num_receivers, samples_per_receiver), e.g. (20, 360)
@@ -172,6 +183,26 @@ class TransformerCBG(nn.Module):
             nn.Linear(embed_dim, embed_dim),
         )
 
+        # --- Per-type LayerNorm: equalize token scales before concatenation ---
+        # Without this, image tokens are 50-3200x larger than measurement tokens
+        # (depends on sigma), drowning out the signal that gets decoded to output.
+        if input_norm:
+            self.img_norm = nn.LayerNorm(embed_dim)
+            self.meas_norm = nn.LayerNorm(embed_dim)
+            self.sigma_norm = nn.LayerNorm(embed_dim)
+            if use_tweedie_input:
+                self.tweedie_norm = nn.LayerNorm(embed_dim)
+
+        # --- Learned output query tokens (decouples output from meas residual) ---
+        # When enabled, output is decoded from these fixed learned tokens instead
+        # of from the measurement token positions. This eliminates the residual
+        # shortcut from y -> output that lets the model ignore x_t.
+        if query_output:
+            self.output_queries = nn.Parameter(
+                torch.randn(1, self.num_receivers, embed_dim) * 0.02)
+            if input_norm:
+                self.query_norm = nn.LayerNorm(embed_dim)
+
         # --- Dropout on combined token embeddings ---
         self.emb_drop = nn.Dropout(dropout)
 
@@ -182,20 +213,28 @@ class TransformerCBG(nn.Module):
         ])
         self.final_norm = nn.LayerNorm(embed_dim)
 
-        # --- Output head: decode measurement token positions ---
-        self.out_proj = nn.Linear(embed_dim, self.receiver_real_dim)
+        # --- Output head ---
+        if scalar_output:
+            # Pool all tokens -> scalar prediction of ||residual||²
+            self.out_proj = nn.Linear(embed_dim, 1)
+        else:
+            # Decode measurement token positions -> full residual vector
+            self.out_proj = nn.Linear(embed_dim, self.receiver_real_dim)
         nn.init.normal_(self.out_proj.weight, std=0.02)
         nn.init.zeros_(self.out_proj.bias)
 
-    def forward(self, x_t, sigma, y):
+    def forward(self, x_t, sigma, y, denoised=None):
         """
         Args:
-            x_t:   [B, C, H, W] noisy image
-            sigma: [B] or scalar noise level
-            y:     [B, *obs_shape] measurements (complex)
+            x_t:      [B, C, H, W] noisy image
+            sigma:    [B] or scalar noise level
+            y:        [B, *obs_shape] measurements (complex)
+            denoised: [B, C, H, W] Tweedie denoised image (optional).
+                      Required when use_tweedie_input=True.
 
         Returns:
-            [B, meas_flat_dim] predicted measurement residual
+            [B, meas_flat_dim] predicted measurement residual (vector output)
+            or [B, 1] predicted ||residual||² (scalar output)
         """
         B = x_t.shape[0]
         device = x_t.device
@@ -204,15 +243,26 @@ class TransformerCBG(nn.Module):
         # [B, C, H, W] -> [B, num_patches, patch_dim]
         patches = rearrange(x_t, 'b c (h p1) (w p2) -> b (h w) (c p1 p2)',
                            p1=self.patch_size, p2=self.patch_size)
-        img_tokens = self.patch_proj(patches) + self.patch_pos_emb  # [B, 256, D]
+        img_tokens = self.patch_proj(patches) + self.patch_pos_emb  # [B, 64, D]
+
+        # --- 1b. Tweedie tokens (if enabled) ---
+        if self.use_tweedie_input and denoised is not None:
+            tw_patches = rearrange(denoised, 'b c (h p1) (w p2) -> b (h w) (c p1 p2)',
+                                   p1=self.patch_size, p2=self.patch_size)
+            tw_tokens = self.tweedie_patch_proj(tw_patches) + self.tweedie_pos_emb  # [B, 64, D]
+        else:
+            tw_tokens = None
 
         # --- 2. Measurement tokens (per-receiver) ---
-        if y.is_complex():
-            y_real = torch.view_as_real(y).float()  # [B, 20, 360, 2]
+        if y is not None:
+            if y.is_complex():
+                y_real = torch.view_as_real(y).float()  # [B, 20, 360, 2]
+            else:
+                y_real = y.float()
+            y_flat = y_real.reshape(B, self.num_receivers, -1)  # [B, 20, 720]
+            meas_tokens = self.meas_proj(y_flat) + self.meas_pos_emb  # [B, 20, D]
         else:
-            y_real = y.float()
-        y_flat = y_real.reshape(B, self.num_receivers, -1)  # [B, 20, 720]
-        meas_tokens = self.meas_proj(y_flat) + self.meas_pos_emb  # [B, 20, D]
+            meas_tokens = None
 
         # --- 3. Sigma token ---
         if not isinstance(sigma, torch.Tensor):
@@ -225,21 +275,160 @@ class TransformerCBG(nn.Module):
         sigma_emb = timestep_embedding(sigma_t.log(), self.embed_dim)
         sigma_token = self.sigma_mlp(sigma_emb).unsqueeze(1)  # [B, 1, D]
 
-        # --- 4. Concatenate: [sigma | image | measurement] ---
-        tokens = torch.cat([sigma_token, img_tokens, meas_tokens], dim=1)
-        # total tokens: 1 + num_patches + num_receivers = 277
+        # --- 3b. Per-type LayerNorm: equalize scales before concatenation ---
+        if self.input_norm:
+            img_tokens = self.img_norm(img_tokens)
+            if meas_tokens is not None:
+                meas_tokens = self.meas_norm(meas_tokens)
+            sigma_token = self.sigma_norm(sigma_token)
+            if tw_tokens is not None:
+                tw_tokens = self.tweedie_norm(tw_tokens)
+
+        # --- 4. Output query tokens (if enabled) ---
+        if self.query_output:
+            query_tokens = self.output_queries.expand(B, -1, -1)  # [B, 20, D]
+            if self.input_norm:
+                query_tokens = self.query_norm(query_tokens)
+        else:
+            query_tokens = None
+
+        # --- 5. Concatenate tokens ---
+        # [sigma | x_t_patches | tweedie_patches (opt) | measurement (opt) | output_queries (opt)]
+        parts = [sigma_token, img_tokens]
+        if tw_tokens is not None:
+            parts.append(tw_tokens)
+        if meas_tokens is not None:
+            parts.append(meas_tokens)
+        if query_tokens is not None:
+            parts.append(query_tokens)
+        tokens = torch.cat(parts, dim=1)
         tokens = self.emb_drop(tokens)
 
-        # --- 5. Transformer ---
+        # --- 6. Transformer ---
         for block in self.blocks:
             tokens = block(tokens)
         tokens = self.final_norm(tokens)
 
-        # --- 6. Extract measurement tokens and decode ---
-        meas_start = 1 + self.num_patches  # after sigma + image tokens
-        meas_out = tokens[:, meas_start:meas_start + self.num_receivers]  # [B, 20, D]
-        decoded = self.out_proj(meas_out)  # [B, 20, 720]
-        return decoded.reshape(B, -1)  # [B, 14400]
+        # --- 7. Output ---
+        if self.scalar_output:
+            # Pool all tokens -> scalar prediction
+            pooled = tokens.mean(dim=1)  # [B, D]
+            return self.out_proj(pooled)  # [B, 1]
+        elif self.query_output:
+            # Decode from output query token positions (at the end)
+            query_start = tokens.shape[1] - self.num_receivers
+            query_out = tokens[:, query_start:]  # [B, 20, D]
+            decoded = self.out_proj(query_out)  # [B, 20, 720]
+            return decoded.reshape(B, -1)  # [B, 14400]
+        else:
+            # Extract measurement tokens and decode (legacy)
+            meas_start = 1 + self.num_patches  # after sigma + x_t tokens
+            if tw_tokens is not None:
+                meas_start += self.num_patches  # also skip tweedie tokens
+            meas_out = tokens[:, meas_start:meas_start + self.num_receivers]  # [B, 20, D]
+            decoded = self.out_proj(meas_out)  # [B, 20, 720]
+            return decoded.reshape(B, -1)  # [B, 14400]
+
+
+class ForwardSurrogate(nn.Module):
+    """Differentiable surrogate for the forward operator A.
+
+    Simple ViT: image in -> A(image) out.  No sigma, no x_t, no measurements.
+    Used at inference inside a DPS-style loop where gradient flows through
+    the diffusion model to get meaningful ∇_{x_t}.
+
+    forward(x_t, sigma, y, denoised=None):
+        - Uses `denoised` if provided, else `x_t`
+        - `sigma` and `y` are ignored (kept for interface compat)
+    """
+
+    def __init__(self, img_resolution=128, img_channels=1,
+                 obs_shape=(20, 360), meas_flat_dim=14400,
+                 embed_dim=256, num_layers=4, num_heads=4, ffn_mult=2,
+                 patch_size=16, dropout=0.0, num_output_tokens=20):
+        super().__init__()
+        self.img_resolution = img_resolution
+        self.img_channels = img_channels
+        self.obs_shape = obs_shape
+        self.meas_flat_dim = meas_flat_dim
+        self.embed_dim = embed_dim
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.ffn_mult = ffn_mult
+        self.patch_size = patch_size
+        self.dropout = dropout
+        self.num_output_tokens = num_output_tokens
+        # Interface compat flags
+        self.scalar_output = False
+        self.use_tweedie_input = False
+        self.input_norm = False
+        self.query_output = False
+
+        # --- Image tokenization (ViT-style) ---
+        num_patches = (img_resolution // patch_size) ** 2
+        patch_dim = img_channels * patch_size * patch_size
+        self.num_patches = num_patches
+        self.patch_proj = nn.Linear(patch_dim, embed_dim)
+        self.patch_pos_emb = nn.Parameter(
+            torch.randn(1, num_patches, embed_dim) * 0.02)
+
+        # --- Learned output query tokens ---
+        self.num_receivers = obs_shape[0]
+        receiver_dim = 1
+        for s in obs_shape[1:]:
+            receiver_dim *= s
+        self.receiver_real_dim = receiver_dim * 2
+        self.output_queries = nn.Parameter(
+            torch.randn(1, num_output_tokens, embed_dim) * 0.02)
+
+        # --- Dropout ---
+        self.emb_drop = nn.Dropout(dropout)
+
+        # --- Transformer blocks ---
+        self.blocks = nn.ModuleList([
+            TransformerBlock(embed_dim, num_heads, ffn_mult, dropout=dropout)
+            for _ in range(num_layers)
+        ])
+        self.final_norm = nn.LayerNorm(embed_dim)
+
+        # --- Output head: decode query tokens -> measurement vector ---
+        self.out_proj = nn.Linear(embed_dim, self.receiver_real_dim)
+        nn.init.normal_(self.out_proj.weight, std=0.02)
+        nn.init.zeros_(self.out_proj.bias)
+
+    def forward(self, x_t, sigma, y, denoised=None):
+        """
+        Args:
+            x_t:      [B, C, H, W] (used only if denoised is None)
+            sigma:    ignored
+            y:        ignored
+            denoised: [B, C, H, W] Tweedie estimate (preferred input)
+
+        Returns:
+            [B, meas_flat_dim] predicted A(image)
+        """
+        img = denoised if denoised is not None else x_t
+        B = img.shape[0]
+
+        # Patchify -> project -> add pos emb
+        patches = rearrange(img, 'b c (h p1) (w p2) -> b (h w) (c p1 p2)',
+                           p1=self.patch_size, p2=self.patch_size)
+        tokens = self.patch_proj(patches) + self.patch_pos_emb  # [B, N, D]
+
+        # Append output query tokens
+        queries = self.output_queries.expand(B, -1, -1)  # [B, Q, D]
+        tokens = torch.cat([tokens, queries], dim=1)  # [B, N+Q, D]
+        tokens = self.emb_drop(tokens)
+
+        # Transformer
+        for block in self.blocks:
+            tokens = block(tokens)
+        tokens = self.final_norm(tokens)
+
+        # Decode query tokens
+        query_out = tokens[:, -self.num_output_tokens:]  # [B, Q, D]
+        decoded = self.out_proj(query_out)  # [B, Q, receiver_real_dim]
+        return decoded.reshape(B, -1)  # [B, meas_flat_dim]
 
 
 # ---------------------------------------------------------------------------
@@ -822,10 +1011,33 @@ class MeasurementPredictor(nn.Module):
 def save_classifier(classifier, path, metadata=None):
     """Save classifier state_dict + architecture config + optional metadata.
 
-    Dispatches on architecture type: 'unet' (MeasurementPredictor) or
-    'transformer' (TransformerCBG).
+    Dispatches on architecture type: 'surrogate' (ForwardSurrogate),
+    'transformer' (TransformerCBG), or 'unet' (MeasurementPredictor).
     """
-    if isinstance(classifier, TransformerCBG):
+    if isinstance(classifier, ForwardSurrogate):
+        config = {
+            'arch': 'surrogate',
+            'img_resolution': classifier.img_resolution,
+            'img_channels': classifier.img_channels,
+            'obs_shape': list(classifier.obs_shape),
+            'meas_flat_dim': classifier.meas_flat_dim,
+            'embed_dim': classifier.embed_dim,
+            'num_layers': classifier.num_layers,
+            'num_heads': classifier.num_heads,
+            'ffn_mult': classifier.ffn_mult,
+            'patch_size': classifier.patch_size,
+            'dropout': classifier.dropout,
+            'num_output_tokens': classifier.num_output_tokens,
+        }
+        checkpoint = {
+            'state_dict': classifier.state_dict(),
+            'config': config,
+        }
+        if metadata:
+            checkpoint.update(metadata)
+        torch.save(checkpoint, path)
+        return
+    elif isinstance(classifier, TransformerCBG):
         config = {
             'arch': 'transformer',
             'img_resolution': classifier.img_resolution,
@@ -838,6 +1050,10 @@ def save_classifier(classifier, path, metadata=None):
             'ffn_mult': classifier.ffn_mult,
             'patch_size': classifier.patch_size,
             'dropout': classifier.dropout,
+            'use_tweedie_input': classifier.use_tweedie_input,
+            'scalar_output': classifier.scalar_output,
+            'input_norm': classifier.input_norm,
+            'query_output': classifier.query_output,
         }
         checkpoint = {
             'state_dict': classifier.state_dict(),
@@ -888,9 +1104,22 @@ def load_classifier(path, device='cuda'):
 
     arch = config.pop('arch', 'unet')
 
+    if arch == 'surrogate':
+        if 'obs_shape' in config:
+            config['obs_shape'] = tuple(config['obs_shape'])
+        classifier = ForwardSurrogate(**config).to(device)
+        classifier.load_state_dict(checkpoint['state_dict'])
+        classifier.eval()
+        return classifier
+
     if arch == 'transformer':
         if 'obs_shape' in config:
             config['obs_shape'] = tuple(config['obs_shape'])
+        # Backward compat: old checkpoints lack these keys
+        config.setdefault('use_tweedie_input', False)
+        config.setdefault('scalar_output', False)
+        config.setdefault('input_norm', False)
+        config.setdefault('query_output', False)
         classifier = TransformerCBG(**config).to(device)
         classifier.load_state_dict(checkpoint['state_dict'])
         classifier.eval()
