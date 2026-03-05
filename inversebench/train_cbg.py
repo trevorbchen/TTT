@@ -950,9 +950,36 @@ def main(config: DictConfig):
                         step_losses[max(0, len(step_losses) - val_every_steps):])
                     epoch_train_losses.append(avg_recent)
 
+                    # Gen-domain validation: evaluate on fresh diffusion samples
+                    gen_val_str = ""
+                    if gen_buffer is not None:
+                        gen_val_loss = 0.0
+                        gen_val_batches = 0
+                        with torch.no_grad():
+                            for _ in range(max(1, n_val // gen_buffer.buffer_size)):
+                                gen_buffer.refresh()
+                                for gi in range(gen_buffer.buffer_size):
+                                    x0g, y_bg = gen_buffer.images[gi:gi+1], gen_buffer.measurements[gi:gi+1]
+                                    svg = sample_sigma(net, 1, device)
+                                    svg_bc = svg.view(-1, 1, 1, 1)
+                                    epsg = torch.randn_like(x0g)
+                                    x_ng = x0g + svg_bc * epsg
+                                    dg = net(x_ng, svg)
+                                    y_hg = forward_op({'target': dg})
+                                    if y_hg.is_complex():
+                                        tg = torch.view_as_real(y_hg).flatten(1).float()
+                                    else:
+                                        tg = y_hg.flatten(1).float()
+                                    pg = classifier(x_ng, svg, None, denoised=dg)
+                                    gen_val_loss += (pg - tg).pow(2).flatten(1).sum(-1).mean().item()
+                                    gen_val_batches += 1
+                        avg_gen_val = gen_val_loss / max(gen_val_batches, 1)
+                        gen_val_str = f" | gen_val={avg_gen_val:.6f}"
+                        gen_buffer.refresh()  # restore buffer for training
+
                     logger.log(f"  VAL @ step {global_step}: "
                                f"train_avg={avg_recent:.6f} | "
-                               f"val={avg_val:.6f}")
+                               f"val={avg_val:.6f}{gen_val_str}")
 
                     is_best = avg_val < best_val_loss
                     if is_best:
