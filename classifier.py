@@ -432,6 +432,170 @@ class ForwardSurrogate(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# FNO (Fourier Neural Operator) surrogate
+# ---------------------------------------------------------------------------
+
+def _compl_mul2d(a, b):
+    """Complex multiplication for 2D spectral convolutions.
+
+    a: [B, Ci, M1, M2]  (complex)
+    b: [Ci, Co, M1, M2] (complex)
+    -> [B, Co, M1, M2]  (complex)
+    """
+    return torch.einsum("bixy,ioxy->boxy", a, b)
+
+
+class SpectralConv2d(nn.Module):
+    """2D spectral convolution via truncated FFT.
+
+    Learns weights for the lowest `modes` Fourier modes in each spatial
+    dimension, providing implicit regularization: high-frequency image
+    details can't be memorized because they're simply not represented.
+
+    Uses fft2/ifft2 (not rfft2/irfft2) for backward-pass compatibility
+    with MKL on Windows (irfft2 backward triggers MKL DFTI errors).
+    """
+
+    def __init__(self, in_channels, out_channels, modes):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.modes = modes  # number of Fourier modes to keep per dimension
+
+        scale = 1.0 / (in_channels * out_channels)
+        # Two weight tensors for the two halves of the 2D FFT spectrum
+        self.weight1 = nn.Parameter(
+            scale * torch.randn(in_channels, out_channels, modes, modes, 2))
+        self.weight2 = nn.Parameter(
+            scale * torch.randn(in_channels, out_channels, modes, modes, 2))
+
+    def forward(self, x):
+        """x: [B, C, H, W] real -> [B, C_out, H, W] real."""
+        B, C, H, W = x.shape
+        M = self.modes
+
+        # Full fft2: [B, C, H, W] complex
+        x_ft = torch.fft.fft2(x)
+
+        # Multiply low-frequency modes with learned weights
+        w1 = torch.view_as_complex(self.weight1)  # [Ci, Co, M, M]
+        w2 = torch.view_as_complex(self.weight2)
+
+        part1 = _compl_mul2d(x_ft[:, :, :M, :M], w1)   # [B, Co, M, M]
+        part2 = _compl_mul2d(x_ft[:, :, -M:, :M], w2)   # [B, Co, M, M]
+
+        # Construct output via padding (avoids in-place indexing)
+        out1 = F.pad(part1, (0, W - M, 0, H - M))       # [B, Co, H, W]
+        out2 = F.pad(part2, (0, W - M, H - M, 0))       # [B, Co, H, W]
+        out_ft = out1 + out2
+
+        # ifft2 back to spatial domain, take real part
+        return torch.fft.ifft2(out_ft).real
+
+
+class FNOBlock(nn.Module):
+    """Single FNO layer: spectral conv + pointwise conv + residual.
+
+    Uses InstanceNorm2d (not LayerNorm, which kills gradients in this codebase).
+    """
+
+    def __init__(self, width, modes):
+        super().__init__()
+        self.spectral_conv = SpectralConv2d(width, width, modes)
+        self.pointwise = nn.Conv2d(width, width, 1)
+        self.norm = nn.InstanceNorm2d(width)
+
+    def forward(self, x):
+        """x: [B, width, H, W] -> [B, width, H, W]."""
+        h = self.spectral_conv(x) + self.pointwise(x)
+        h = self.norm(h)
+        h = F.gelu(h)
+        return x + h  # residual
+
+
+class FNOSurrogate(nn.Module):
+    """Fourier Neural Operator surrogate for the forward operator A.
+
+    Spectral convolutions provide implicit regularization via Fourier mode
+    truncation (can't memorize high-freq image details) and spatial inductive
+    bias — addressing the massive overfitting seen in the ViT ForwardSurrogate.
+
+    Interface matches ForwardSurrogate: forward(x_t, sigma, y, denoised=None)
+    uses `denoised` if provided, ignores sigma/y.
+    """
+
+    def __init__(self, img_resolution=128, img_channels=1,
+                 obs_shape=(20, 360), meas_flat_dim=14400,
+                 width=64, modes=16, num_layers=4,
+                 dropout=0.0, mlp_ratio=2):
+        super().__init__()
+        self.img_resolution = img_resolution
+        self.img_channels = img_channels
+        self.obs_shape = obs_shape
+        self.meas_flat_dim = meas_flat_dim
+        self.width = width
+        self.modes = modes
+        self.num_layers = num_layers
+        self.dropout_rate = dropout
+        self.mlp_ratio = mlp_ratio
+
+        # Interface compat flags (matched from ForwardSurrogate)
+        self.scalar_output = False
+        self.use_tweedie_input = False
+        self.input_norm = False
+        self.query_output = False
+
+        # --- Lift: project image channels to FNO width ---
+        self.lift = nn.Conv2d(img_channels, width, 1)
+
+        # --- FNO blocks ---
+        self.blocks = nn.ModuleList([
+            FNOBlock(width, modes) for _ in range(num_layers)
+        ])
+
+        # --- Dropout ---
+        self.drop = nn.Dropout(dropout)
+
+        # --- Head: global avg pool -> MLP -> measurement vector ---
+        hidden = width * mlp_ratio
+        self.head = nn.Sequential(
+            nn.Linear(width, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, meas_flat_dim),
+        )
+
+        # Output init: small weights, zero bias
+        nn.init.normal_(self.head[-1].weight, std=0.01)
+        nn.init.zeros_(self.head[-1].bias)
+
+    def forward(self, x_t, sigma, y, denoised=None):
+        """
+        Args:
+            x_t:      [B, C, H, W] (used only if denoised is None)
+            sigma:    ignored
+            y:        ignored
+            denoised: [B, C, H, W] Tweedie estimate (preferred input)
+
+        Returns:
+            [B, meas_flat_dim] predicted A(image)
+        """
+        img = denoised if denoised is not None else x_t
+
+        # Lift to FNO width
+        h = self.lift(img)  # [B, width, H, W]
+
+        # FNO blocks
+        for block in self.blocks:
+            h = block(h)
+
+        # Global average pool -> MLP head
+        h = h.mean(dim=(-2, -1))  # [B, width]
+        h = self.drop(h)
+        return self.head(h)  # [B, meas_flat_dim]
+
+
+# ---------------------------------------------------------------------------
 # Measurement encoder (for non-image observations)
 # ---------------------------------------------------------------------------
 
@@ -1014,7 +1178,28 @@ def save_classifier(classifier, path, metadata=None):
     Dispatches on architecture type: 'surrogate' (ForwardSurrogate),
     'transformer' (TransformerCBG), or 'unet' (MeasurementPredictor).
     """
-    if isinstance(classifier, ForwardSurrogate):
+    if isinstance(classifier, FNOSurrogate):
+        config = {
+            'arch': 'fno',
+            'img_resolution': classifier.img_resolution,
+            'img_channels': classifier.img_channels,
+            'obs_shape': list(classifier.obs_shape),
+            'meas_flat_dim': classifier.meas_flat_dim,
+            'width': classifier.width,
+            'modes': classifier.modes,
+            'num_layers': classifier.num_layers,
+            'dropout': classifier.dropout_rate,
+            'mlp_ratio': classifier.mlp_ratio,
+        }
+        checkpoint = {
+            'state_dict': classifier.state_dict(),
+            'config': config,
+        }
+        if metadata:
+            checkpoint.update(metadata)
+        torch.save(checkpoint, path)
+        return
+    elif isinstance(classifier, ForwardSurrogate):
         config = {
             'arch': 'surrogate',
             'img_resolution': classifier.img_resolution,
@@ -1103,6 +1288,14 @@ def load_classifier(path, device='cuda'):
     config = dict(checkpoint['config'])
 
     arch = config.pop('arch', 'unet')
+
+    if arch == 'fno':
+        if 'obs_shape' in config:
+            config['obs_shape'] = tuple(config['obs_shape'])
+        classifier = FNOSurrogate(**config).to(device)
+        classifier.load_state_dict(checkpoint['state_dict'])
+        classifier.eval()
+        return classifier
 
     if arch == 'surrogate':
         if 'obs_shape' in config:

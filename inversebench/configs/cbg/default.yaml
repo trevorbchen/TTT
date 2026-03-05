@@ -19,6 +19,24 @@ num_layers: 4
 num_heads: 4
 ffn_mult: 2
 dropout: 0.1        # dropout in attention, FFN, and embeddings
+use_tweedie_input: false  # feed Tweedie denoised image as extra input tokens
+scalar_output: false      # predict ||residual||² (1-dim) instead of full residual
+input_norm: true          # per-type LayerNorm on token embeddings (equalizes scales)
+query_output: false       # decode from learned output queries (breaks y->output residual shortcut)
+
+# FNO architecture (used when arch=fno)
+fno_width: 64
+fno_modes: 16
+fno_mlp_ratio: 2
+
+# Jacobian matching loss (requires differentiable forward_op)
+jac_loss: false
+jac_lambda: 1.0
+
+# Sigma curriculum: only train on sigma in [min, max]
+# 0/1000 = no filtering (use all sigma levels)
+sigma_min_curriculum: 0.0
+sigma_max_curriculum: 1000.0
 
 # Loss: "mse" or "cosine"
 loss_type: cosine
