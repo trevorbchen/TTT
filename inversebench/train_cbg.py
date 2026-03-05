@@ -356,7 +356,8 @@ def main(config: DictConfig):
     pass_tag = f"_p{num_passes}" if num_passes > 1 else ""
     arch_tag = f"_{arch}" if arch != "unet" else ""
     loss_tag = f"_{loss_type}" if loss_type != "mse" else ""
-    root = Path(save_dir) / f"{problem_name}_cbg_{target_mode}_{train_pct}pct_lr{lr}_ch{base_channels}{arch_tag}{loss_tag}{snr_tag}{norm_tag}{pass_tag}"
+    jac_tag = f"_jac{jac_lambda}" if jac_loss else ""
+    root = Path(save_dir) / f"{problem_name}_cbg_{target_mode}_{train_pct}pct_lr{lr}_ch{base_channels}{arch_tag}{loss_tag}{snr_tag}{norm_tag}{pass_tag}{jac_tag}"
     root.mkdir(parents=True, exist_ok=True)
 
     # --- Logger ---
