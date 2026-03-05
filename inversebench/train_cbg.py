@@ -191,9 +191,11 @@ class DiffusionPriorBuffer:
         while remaining > 0:
             bs = min(remaining, self.gen_batch_size)
             imgs = self._sample_batch(bs)
-            meas = self.forward_op({'target': imgs})
+            # forward_op may not support batching — apply per-sample
+            for j in range(bs):
+                meas_j = self.forward_op({'target': imgs[j:j+1]})
+                all_meas.append(meas_j)
             all_imgs.append(imgs)
-            all_meas.append(meas)
             remaining -= bs
         self.images = torch.cat(all_imgs)[:self.buffer_size]
         self.measurements = torch.cat(all_meas)[:self.buffer_size]
