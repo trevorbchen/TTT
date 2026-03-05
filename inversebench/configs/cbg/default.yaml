@@ -68,5 +68,12 @@ val_fraction: 0.1
 target_mode: tweedie    # "tweedie" or "direct"
 normalize_target: false  # cosine loss handles scale-invariance
 
+# On-the-fly diffusion prior sampling
+gen_samples: false           # enable synthetic sample generation
+gen_buffer_size: 128         # number of synthetic samples in buffer
+gen_batch_size: 8            # parallel diffusion samples per generation call
+gen_steps: 50                # diffusion steps for generation (fewer = faster, 50 is fine)
+gen_mix_ratio: 1.0           # fraction using generated data (1.0 = all gen, 0.5 = half/half)
+
 # Output
 save_dir: exps/cbg

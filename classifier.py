@@ -596,6 +596,168 @@ class FNOSurrogate(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# UNet surrogate for forward operator A
+# ---------------------------------------------------------------------------
+
+class UNetResBlock(nn.Module):
+    """Unconditional pre-activation ResBlock (no FiLM / sigma conditioning).
+
+    GroupNorm -> SiLU -> Conv -> GroupNorm -> SiLU -> zero_Conv + skip.
+    """
+
+    def __init__(self, in_ch, out_ch, dropout=0.0):
+        super().__init__()
+        self.norm1 = nn.GroupNorm(min(32, in_ch), in_ch)
+        self.conv1 = nn.Conv2d(in_ch, out_ch, 3, padding=1)
+        self.norm2 = nn.GroupNorm(min(32, out_ch), out_ch)
+        self.drop = nn.Dropout(dropout)
+        self.conv2 = zero_module(nn.Conv2d(out_ch, out_ch, 3, padding=1))
+        self.skip = nn.Identity() if in_ch == out_ch else nn.Conv2d(in_ch, out_ch, 1)
+
+    def forward(self, x):
+        h = F.silu(self.norm1(x))
+        h = self.conv1(h)
+        h = F.silu(self.norm2(h))
+        h = self.drop(h)
+        h = self.conv2(h)
+        return self.skip(x) + h
+
+
+class UNetSurrogate(nn.Module):
+    """UNet-based surrogate for the forward operator A.
+
+    Encoder-decoder with skip connections, designed for better inductive bias
+    on sparse/structured data compared to ViT (ForwardSurrogate).
+
+    Follows the same encoder/decoder pattern as MeasurementPredictor:
+    every level downsamples (encoder) and upsamples (decoder), with one
+    skip connection per level.
+
+    Interface matches ForwardSurrogate: forward(x_t, sigma, y, denoised=None)
+    uses `denoised` if provided, ignores sigma/y.
+    """
+
+    def __init__(self, img_resolution=128, img_channels=1,
+                 obs_shape=(20, 360), meas_flat_dim=14400,
+                 base_channels=64, channel_mult=(1, 2, 4, 4),
+                 num_res_blocks=2, attn_heads=4,
+                 dropout=0.0, mlp_ratio=2):
+        super().__init__()
+        self.img_resolution = img_resolution
+        self.img_channels = img_channels
+        self.obs_shape = obs_shape
+        self.meas_flat_dim = meas_flat_dim
+        self.base_channels = base_channels
+        self.channel_mult = list(channel_mult)
+        self.num_res_blocks = num_res_blocks
+        self.dropout_rate = dropout
+        self.mlp_ratio = mlp_ratio
+
+        # Interface compat flags
+        self.scalar_output = False
+        self.use_tweedie_input = False
+        self.input_norm = False
+        self.query_output = False
+
+        C = base_channels
+        ch_list = [C * m for m in channel_mult]  # e.g. [64, 128, 256, 256]
+        bot_ch = ch_list[-1]
+
+        # --- Input conv ---
+        self.input_conv = nn.Conv2d(img_channels, C, 3, padding=1)
+
+        # --- Encoder: ResBlocks -> skip -> downsample, at every level ---
+        self.enc_blocks = nn.ModuleList()
+        self.downsamples = nn.ModuleList()
+        prev_ch = C
+        for cur_ch in ch_list:
+            level_blocks = nn.ModuleList()
+            for j in range(num_res_blocks):
+                level_blocks.append(UNetResBlock(
+                    prev_ch if j == 0 else cur_ch, cur_ch, dropout))
+            self.enc_blocks.append(level_blocks)
+            self.downsamples.append(nn.Conv2d(cur_ch, cur_ch, 3, stride=2, padding=1))
+            prev_ch = cur_ch
+
+        # --- Bottleneck ---
+        self.mid_block1 = UNetResBlock(bot_ch, bot_ch, dropout)
+        self.mid_attn = SelfAttention(bot_ch, attn_heads)
+        self.mid_block2 = UNetResBlock(bot_ch, bot_ch, dropout)
+
+        # --- Decoder: upsample -> cat skip -> ResBlocks, at every level ---
+        self.upsample_layers = nn.ModuleList()
+        self.dec_blocks = nn.ModuleList()
+        dec_prev_ch = bot_ch
+        for i in reversed(range(len(channel_mult))):
+            skip_ch = ch_list[i]
+            dec_out_ch = ch_list[i - 1] if i > 0 else C
+            self.upsample_layers.append(nn.Upsample(scale_factor=2, mode='nearest'))
+            level_blocks = nn.ModuleList()
+            for j in range(num_res_blocks):
+                in_ch = (dec_prev_ch + skip_ch) if j == 0 else dec_out_ch
+                level_blocks.append(UNetResBlock(in_ch, dec_out_ch, dropout))
+            self.dec_blocks.append(level_blocks)
+            dec_prev_ch = dec_out_ch
+
+        # --- Output: norm -> adaptive pool -> MLP head ---
+        # Pool to 8x8 to preserve spatial info (C*8*8 >> C after global avg pool)
+        self.out_norm = nn.GroupNorm(min(32, C), C)
+        pool_size = 8
+        pool_dim = C * pool_size * pool_size  # e.g. 64*8*8 = 4096
+        hidden = min(pool_dim, 2048)
+        self.pool = nn.AdaptiveAvgPool2d(pool_size)
+        self.head = nn.Sequential(
+            nn.Flatten(1),
+            nn.Linear(pool_dim, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, meas_flat_dim),
+        )
+        nn.init.normal_(self.head[-1].weight, std=0.01)
+        nn.init.zeros_(self.head[-1].bias)
+
+    def forward(self, x_t, sigma, y, denoised=None):
+        """
+        Args:
+            x_t:      [B, C, H, W] (used only if denoised is None)
+            sigma:    ignored
+            y:        ignored
+            denoised: [B, C, H, W] Tweedie estimate (preferred input)
+
+        Returns:
+            [B, meas_flat_dim] predicted A(image)
+        """
+        img = denoised if denoised is not None else x_t
+
+        h = self.input_conv(img)
+
+        # Encoder
+        skips = []
+        for level_blocks, down in zip(self.enc_blocks, self.downsamples):
+            for blk in level_blocks:
+                h = blk(h)
+            skips.append(h)
+            h = down(h)
+
+        # Bottleneck
+        h = self.mid_block1(h)
+        h = self.mid_attn(h)
+        h = self.mid_block2(h)
+
+        # Decoder
+        for up, level_blocks in zip(self.upsample_layers, self.dec_blocks):
+            h = up(h)
+            h = torch.cat([h, skips.pop()], dim=1)
+            for blk in level_blocks:
+                h = blk(h)
+
+        # Output head
+        h = F.silu(self.out_norm(h))
+        h = self.pool(h)          # [B, C, 8, 8]
+        return self.head(h)       # [B, meas_flat_dim]
+
+
+# ---------------------------------------------------------------------------
 # Measurement encoder (for non-image observations)
 # ---------------------------------------------------------------------------
 
@@ -1178,7 +1340,28 @@ def save_classifier(classifier, path, metadata=None):
     Dispatches on architecture type: 'surrogate' (ForwardSurrogate),
     'transformer' (TransformerCBG), or 'unet' (MeasurementPredictor).
     """
-    if isinstance(classifier, FNOSurrogate):
+    if isinstance(classifier, UNetSurrogate):
+        config = {
+            'arch': 'unet_surrogate',
+            'img_resolution': classifier.img_resolution,
+            'img_channels': classifier.img_channels,
+            'obs_shape': list(classifier.obs_shape),
+            'meas_flat_dim': classifier.meas_flat_dim,
+            'base_channels': classifier.base_channels,
+            'channel_mult': list(classifier.channel_mult),
+            'num_res_blocks': classifier.num_res_blocks,
+            'dropout': classifier.dropout_rate,
+            'mlp_ratio': classifier.mlp_ratio,
+        }
+        checkpoint = {
+            'state_dict': classifier.state_dict(),
+            'config': config,
+        }
+        if metadata:
+            checkpoint.update(metadata)
+        torch.save(checkpoint, path)
+        return
+    elif isinstance(classifier, FNOSurrogate):
         config = {
             'arch': 'fno',
             'img_resolution': classifier.img_resolution,
@@ -1293,6 +1476,16 @@ def load_classifier(path, device='cuda'):
         if 'obs_shape' in config:
             config['obs_shape'] = tuple(config['obs_shape'])
         classifier = FNOSurrogate(**config).to(device)
+        classifier.load_state_dict(checkpoint['state_dict'])
+        classifier.eval()
+        return classifier
+
+    if arch == 'unet_surrogate':
+        if 'obs_shape' in config:
+            config['obs_shape'] = tuple(config['obs_shape'])
+        if 'channel_mult' in config:
+            config['channel_mult'] = tuple(config['channel_mult'])
+        classifier = UNetSurrogate(**config).to(device)
         classifier.load_state_dict(checkpoint['state_dict'])
         classifier.eval()
         return classifier

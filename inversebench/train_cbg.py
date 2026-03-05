@@ -43,7 +43,7 @@ _repo_root = str(Path(__file__).resolve().parent)
 if _repo_root not in sys.path:
     sys.path.insert(0, _repo_root)
 
-from classifier import MeasurementPredictor, TransformerCBG, ForwardSurrogate, FNOSurrogate, save_classifier
+from classifier import MeasurementPredictor, TransformerCBG, ForwardSurrogate, FNOSurrogate, UNetSurrogate, save_classifier
 from utils.helper import open_url
 
 
@@ -138,6 +138,78 @@ def load_subset(dataset, indices, forward_op, device):
         obs = forward_op({'target': target.unsqueeze(0)})
         measurements.append(obs)
     return torch.stack(images), torch.cat(measurements)
+
+
+# ---------------------------------------------------------------------------
+# On-the-fly diffusion prior sampling
+# ---------------------------------------------------------------------------
+
+class DiffusionPriorBuffer:
+    """Buffer of images sampled from diffusion prior + their measurements."""
+
+    def __init__(self, net, forward_op, device,
+                 buffer_size=128, gen_batch_size=8, num_steps=50):
+        self.net = net
+        self.forward_op = forward_op
+        self.device = device
+        self.buffer_size = buffer_size
+        self.gen_batch_size = gen_batch_size
+        self.num_steps = num_steps
+
+        from utils.scheduler import Scheduler
+        self.scheduler = Scheduler(
+            num_steps=num_steps, schedule="vp",
+            timestep="vp", scaling="vp")
+
+        self.images = None       # [buffer_size, C, H, W]
+        self.measurements = None # [buffer_size, ...]
+        self._cursor = 0        # next unused index
+        self._perm = None       # shuffled index order
+
+    @torch.no_grad()
+    def _sample_batch(self, batch_size):
+        """PF-ODE Euler sampling (same as plain_sample in eval_cbg.py)."""
+        x = torch.randn(batch_size, self.net.img_channels,
+                        self.net.img_resolution, self.net.img_resolution,
+                        device=self.device) * self.scheduler.sigma_max
+        for i in range(self.num_steps):
+            sigma = self.scheduler.sigma_steps[i]
+            scaling = self.scheduler.scaling_steps[i]
+            factor = self.scheduler.factor_steps[i]
+            scaling_factor = self.scheduler.scaling_factor[i]
+            denoised = self.net(
+                x / scaling, torch.as_tensor(sigma).to(self.device))
+            score = (denoised - x / scaling) / sigma ** 2 / scaling
+            x = x * scaling_factor + factor * score * 0.5
+        return x
+
+    def refresh(self, logger=None):
+        """Regenerate entire buffer."""
+        t0 = time.time()
+        all_imgs, all_meas = [], []
+        remaining = self.buffer_size
+        while remaining > 0:
+            bs = min(remaining, self.gen_batch_size)
+            imgs = self._sample_batch(bs)
+            meas = self.forward_op({'target': imgs})
+            all_imgs.append(imgs)
+            all_meas.append(meas)
+            remaining -= bs
+        self.images = torch.cat(all_imgs)[:self.buffer_size]
+        self.measurements = torch.cat(all_meas)[:self.buffer_size]
+        self._perm = torch.randperm(self.buffer_size)
+        self._cursor = 0
+        if logger:
+            logger.log(f"  [GenBuffer] Refreshed {self.buffer_size} samples "
+                       f"in {time.time()-t0:.1f}s")
+
+    def sample(self, logger=None):
+        """Next unused (x0, y) pair. Auto-refreshes when buffer is exhausted."""
+        if self._cursor >= self.buffer_size:
+            self.refresh(logger)
+        idx = self._perm[self._cursor].item()
+        self._cursor += 1
+        return self.images[idx:idx+1], self.measurements[idx:idx+1]
 
 
 # ---------------------------------------------------------------------------
@@ -245,7 +317,7 @@ def evaluate_held_out(classifier, net, forward_op, eval_images,
         else:
             raw_target = y_hat - y_batch
         has_meas_dec = hasattr(classifier, 'measurement_decoder') and classifier.measurement_decoder is not None
-        if has_meas_dec or isinstance(classifier, (ForwardSurrogate, FNOSurrogate)):
+        if has_meas_dec or isinstance(classifier, (ForwardSurrogate, FNOSurrogate, UNetSurrogate)):
             if raw_target.is_complex():
                 target = torch.view_as_real(raw_target).flatten(1).float()
             else:
@@ -342,10 +414,16 @@ def main(config: DictConfig):
     # Jacobian matching loss
     jac_loss      = cbg.get("jac_loss", False)
     jac_lambda    = cbg.get("jac_lambda", 1.0)
+    # On-the-fly diffusion prior sampling
+    gen_samples          = cbg.get("gen_samples", False)
+    gen_buffer_size      = cbg.get("gen_buffer_size", 128)
+    gen_batch_size       = cbg.get("gen_batch_size", 8)
+    gen_steps            = cbg.get("gen_steps", 50)
+    gen_mix_ratio        = cbg.get("gen_mix_ratio", 1.0)
     assert target_mode in ("tweedie", "direct", "forward"), \
         f"Unknown target_mode={target_mode!r}, expected 'tweedie', 'direct', or 'forward'"
-    assert arch in ("unet", "transformer", "surrogate", "fno"), \
-        f"Unknown arch={arch!r}, expected 'unet', 'transformer', 'surrogate', or 'fno'"
+    assert arch in ("unet", "transformer", "surrogate", "fno", "unet_surrogate"), \
+        f"Unknown arch={arch!r}, expected 'unet', 'transformer', 'surrogate', 'fno', or 'unet_surrogate'"
     assert loss_type in ("mse", "cosine"), \
         f"Unknown loss_type={loss_type!r}, expected 'mse' or 'cosine'"
 
@@ -357,7 +435,8 @@ def main(config: DictConfig):
     arch_tag = f"_{arch}" if arch != "unet" else ""
     loss_tag = f"_{loss_type}" if loss_type != "mse" else ""
     jac_tag = f"_jac{jac_lambda}" if jac_loss else ""
-    root = Path(save_dir) / f"{problem_name}_cbg_{target_mode}_{train_pct}pct_lr{lr}_ch{base_channels}{arch_tag}{loss_tag}{snr_tag}{norm_tag}{pass_tag}{jac_tag}"
+    gen_tag = f"_gen{gen_buffer_size}" if gen_samples else ""
+    root = Path(save_dir) / f"{problem_name}_cbg_{target_mode}_{train_pct}pct_lr{lr}_ch{base_channels}{arch_tag}{loss_tag}{snr_tag}{norm_tag}{pass_tag}{jac_tag}{gen_tag}"
     root.mkdir(parents=True, exist_ok=True)
 
     # --- Logger ---
@@ -384,6 +463,8 @@ def main(config: DictConfig):
     if sigma_min_curriculum > 0 or sigma_max_curriculum < 999:
         logger.log(f"  sigma curriculum: [{sigma_min_curriculum}, {sigma_max_curriculum}]")
     logger.log(f"  snr_gamma={snr_gamma} ({'enabled' if snr_gamma > 0 else 'disabled'})")
+    if gen_samples:
+        logger.log(f"  gen: buffer={gen_buffer_size}, steps={gen_steps}, mix={gen_mix_ratio}")
     logger.log(f"  output: {root}")
     logger.log(f"  device: {device}")
     logger.update_progress(status="loading")
@@ -419,6 +500,17 @@ def main(config: DictConfig):
     net.requires_grad_(False)
     logger.log(f"  Model: {type(net).__name__} -> {type(net.model).__name__}")
     logger.log(f"  Resolution: {net.img_resolution}, Channels: {net.img_channels}")
+
+    # --- 1b. Diffusion prior buffer (optional) ---
+    gen_buffer = None
+    if gen_samples:
+        logger.log(f"Setting up diffusion prior buffer: size={gen_buffer_size}, "
+                   f"steps={gen_steps}, batch={gen_batch_size}, mix={gen_mix_ratio}")
+        gen_buffer = DiffusionPriorBuffer(
+            net=net, forward_op=forward_op, device=device,
+            buffer_size=gen_buffer_size, gen_batch_size=gen_batch_size,
+            num_steps=gen_steps)
+        gen_buffer.refresh(logger)
 
     # --- 2. Train/eval split ---
     N = len(train_dataset)
@@ -476,7 +568,25 @@ def main(config: DictConfig):
                    f"out_size={out_size}")
 
     # --- 4. Build classifier ---
-    if arch == "fno":
+    if arch == "unet_surrogate":
+        assert not is_image_obs, "UNetSurrogate requires non-image observations"
+        classifier = UNetSurrogate(
+            img_resolution=net.img_resolution,
+            img_channels=net.img_channels,
+            obs_shape=obs_shape,
+            meas_flat_dim=meas_flat_dim,
+            base_channels=base_channels,
+            channel_mult=channel_mult,
+            num_res_blocks=num_res_blocks,
+            attn_heads=attn_heads,
+            dropout=t_dropout,
+            mlp_ratio=fno_mlp_ratio,
+        ).to(device)
+        num_params = sum(p.numel() for p in classifier.parameters())
+        logger.log(f"UNetSurrogate: {num_params/1e6:.2f}M parameters")
+        logger.log(f"  UNet: ch={base_channels}, mult={channel_mult}, "
+                   f"res_blocks={num_res_blocks}, dropout={t_dropout}")
+    elif arch == "fno":
         assert not is_image_obs, "FNOSurrogate requires non-image observations"
         classifier = FNOSurrogate(
             img_resolution=net.img_resolution,
@@ -616,8 +726,14 @@ def main(config: DictConfig):
     pbar = tqdm.tqdm(all_indices, desc="Training")
 
     for i in pbar:
-                x0 = images[i:i+1]
-                y_single = measurements[i:i+1]
+                # Data source: generated buffer vs LMDB
+                use_generated = (gen_buffer is not None and
+                                 torch.rand(1).item() < gen_mix_ratio)
+                if use_generated:
+                    x0, y_single = gen_buffer.sample(logger)
+                else:
+                    x0 = images[i:i+1]
+                    y_single = measurements[i:i+1]
                 B = sigma_batch_size
                 sigma = sample_sigma(net, B, device)
 
@@ -649,7 +765,7 @@ def main(config: DictConfig):
                             target = torch.view_as_real(raw_target).flatten(1).float()
                         else:
                             target = raw_target.flatten(1).float()
-                    elif isinstance(classifier, (TransformerCBG, ForwardSurrogate, FNOSurrogate)):
+                    elif isinstance(classifier, (TransformerCBG, ForwardSurrogate, FNOSurrogate, UNetSurrogate)):
                         if raw_target.is_complex():
                             target = torch.view_as_real(raw_target).flatten(1).float()
                         else:
@@ -798,7 +914,7 @@ def main(config: DictConfig):
                                     tv = torch.view_as_real(raw_tv).flatten(1).float()
                                 else:
                                     tv = raw_tv.flatten(1).float()
-                            elif isinstance(classifier, (TransformerCBG, ForwardSurrogate, FNOSurrogate)):
+                            elif isinstance(classifier, (TransformerCBG, ForwardSurrogate, FNOSurrogate, UNetSurrogate)):
                                 if raw_tv.is_complex():
                                     tv = torch.view_as_real(raw_tv).flatten(1).float()
                                 else:
