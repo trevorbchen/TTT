@@ -168,7 +168,7 @@ class DiffusionPriorBuffer:
 
     @torch.no_grad()
     def _sample_batch(self, batch_size):
-        """PF-ODE Euler sampling (same as plain_sample in eval_cbg.py)."""
+        """SDE Euler-Maruyama sampling (more diverse than deterministic ODE)."""
         x = torch.randn(batch_size, self.net.img_channels,
                         self.net.img_resolution, self.net.img_resolution,
                         device=self.device) * self.scheduler.sigma_max
@@ -180,7 +180,9 @@ class DiffusionPriorBuffer:
             denoised = self.net(
                 x / scaling, torch.as_tensor(sigma).to(self.device))
             score = (denoised - x / scaling) / sigma ** 2 / scaling
-            x = x * scaling_factor + factor * score * 0.5
+            epsilon = torch.randn_like(x)
+            x = (x * scaling_factor + factor * score
+                 + np.sqrt(factor) * epsilon)
         return x
 
     def refresh(self, logger=None):
