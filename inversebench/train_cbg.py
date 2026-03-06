@@ -428,6 +428,8 @@ def main(config: DictConfig):
     gen_batch_size       = cbg.get("gen_batch_size", 8)
     gen_steps            = cbg.get("gen_steps", 50)
     gen_mix_ratio        = cbg.get("gen_mix_ratio", 1.0)
+    # Resume from checkpoint
+    resume_from          = cbg.get("resume_from", None)
     assert target_mode in ("tweedie", "direct", "forward"), \
         f"Unknown target_mode={target_mode!r}, expected 'tweedie', 'direct', or 'forward'"
     assert arch in ("unet", "transformer", "surrogate", "fno", "unet_surrogate", "grad_predictor"), \
@@ -698,12 +700,29 @@ def main(config: DictConfig):
     optimizer = torch.optim.AdamW(classifier.parameters(), lr=lr,
                                   weight_decay=weight_decay)
 
+    # --- 5b. Resume from checkpoint ---
+    resume_step = 0
+    resume_best_val = float('inf')
+    if resume_from is not None:
+        logger.log(f"Resuming from checkpoint: {resume_from}")
+        ckpt = torch.load(resume_from, map_location=device, weights_only=False)
+        classifier.load_state_dict(ckpt['state_dict'])
+        if 'optimizer_state_dict' in ckpt:
+            optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+            logger.log("  Restored optimizer state")
+        else:
+            logger.log("  No optimizer state in checkpoint, using fresh optimizer")
+        resume_step = ckpt.get('step', 0)
+        resume_best_val = ckpt.get('best_val_loss', float('inf')) or float('inf')
+        logger.log(f"  Resuming from step {resume_step}, best_val={resume_best_val}")
+        del ckpt
+
     # --- 6. Train ---
     step_losses = []
     epoch_train_losses = []
     epoch_val_losses = []
     grad_norms = []
-    best_val_loss = float('inf')
+    best_val_loss = resume_best_val if resume_from else float('inf')
     logger.update_progress(status="training")
 
     # =================================================================
@@ -748,6 +767,14 @@ def main(config: DictConfig):
     all_indices = list(range(n_train)) * num_passes
     np.random.shuffle(all_indices)
 
+    # Fast-forward LR scheduler if resuming
+    if resume_from is not None and resume_step > 0:
+        logger.log(f"  Fast-forwarding LR scheduler to step {resume_step}...")
+        for _ in range(resume_step):
+            lr_scheduler.step()
+        cur_lr = optimizer.param_groups[0]['lr']
+        logger.log(f"  Resumed at step {resume_step}, lr={cur_lr:.2e}")
+
     classifier.train()
     t_pass = time.time()
     is_grad_pred = isinstance(classifier, GradientPredictor)
@@ -755,6 +782,10 @@ def main(config: DictConfig):
     pbar = tqdm.tqdm(all_indices, desc="Training")
 
     for i in pbar:
+                # Skip steps already completed during resume
+                if global_step < resume_step:
+                    global_step += 1
+                    continue
                 # Data source: generated buffer vs LMDB
                 use_generated = (gen_buffer is not None and
                                  torch.rand(1).item() < gen_mix_ratio)
@@ -1083,7 +1114,9 @@ def main(config: DictConfig):
                             str(root / "classifier_best.pt"),
                             metadata={"step": global_step,
                                       "val_loss": avg_val,
-                                      "target_mode": target_mode})
+                                      "best_val_loss": best_val_loss,
+                                      "target_mode": target_mode,
+                                      "optimizer_state_dict": optimizer.state_dict()})
                         logger.log(f"  -> New best val_loss={avg_val:.6f}")
 
                     classifier.train()
@@ -1096,7 +1129,9 @@ def main(config: DictConfig):
                         classifier,
                         str(root / f"classifier_step{global_step}.pt"),
                         metadata={"step": global_step,
-                                  "target_mode": target_mode})
+                                  "best_val_loss": best_val_loss,
+                                  "target_mode": target_mode,
+                                  "optimizer_state_dict": optimizer.state_dict()})
 
                 # Progress update
                 logger.update_progress(
