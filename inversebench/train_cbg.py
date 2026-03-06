@@ -1014,6 +1014,8 @@ def main(config: DictConfig):
                                 val_loss += per_v.mean().item()
                             val_batches += 1
                     else:
+                        val_jac_cos_sum = 0.0
+                        val_jac_batches = 0
                         with torch.no_grad():
                             for v_st in range(0, n_val, batch_size):
                                 x0v = eval_images[v_st:v_st+batch_size]
@@ -1069,7 +1071,60 @@ def main(config: DictConfig):
                                 else:
                                     val_loss += (pv - tv).pow(2).flatten(1).sum(-1).mean().item()
                                 val_batches += 1
+
+                        # Jacobian cosine similarity validation
+                        if jac_loss and target_mode == "forward" and not is_grad_pred:
+                            for v_st in range(0, n_val, batch_size):
+                                x0v = eval_images[v_st:v_st+batch_size]
+                                y_bv = eval_measurements[v_st:v_st+batch_size]
+                                Bv = x0v.shape[0]
+                                sv = sample_sigma(net, Bv, device)
+                                sv_bc = sv.view(-1, 1, 1, 1)
+                                epsv = torch.randn_like(x0v)
+                                x_nv = x0v + sv_bc * epsv
+                                with torch.no_grad():
+                                    dv = net(x_nv, sv)
+                                # True gradient (needs autograd)
+                                dv_jac = dv.detach().requires_grad_(True)
+                                y_hv_jac = torch.cat([forward_op({'target': dv_jac[j:j+1]})
+                                                      for j in range(Bv)])
+                                res_jac = y_hv_jac - y_bv
+                                if res_jac.is_complex():
+                                    loss_jac = torch.view_as_real(res_jac).pow(2).flatten(1).sum(-1)
+                                else:
+                                    loss_jac = res_jac.pow(2).flatten(1).sum(-1)
+                                grad_true_jac = torch.autograd.grad(
+                                    loss_jac.sum(), dv_jac, create_graph=False)[0].detach()
+                                # Surrogate gradient
+                                pv_jac = dv.detach().requires_grad_(True)
+                                pred_jac = classifier(x_nv, sv, None, denoised=pv_jac)
+                                if pred_jac.is_complex():
+                                    pred_flat = torch.view_as_real(pred_jac).flatten(1).float()
+                                else:
+                                    pred_flat = pred_jac.flatten(1).float()
+                                if y_bv.is_complex():
+                                    y_flat_v = torch.view_as_real(y_bv).flatten(1).float()
+                                else:
+                                    y_flat_v = y_bv.flatten(1).float()
+                                surr_loss = (pred_flat - y_flat_v).pow(2).sum(-1)
+                                grad_surr_jac = torch.autograd.grad(
+                                    surr_loss.sum(), pv_jac, create_graph=False)[0].detach()
+                                with torch.no_grad():
+                                    cos_jac = F.cosine_similarity(
+                                        grad_surr_jac.flatten(1), grad_true_jac.flatten(1), dim=-1)
+                                    valid_jac = grad_true_jac.flatten(1).norm(dim=-1) > 1e-6
+                                    cos_jac = torch.where(valid_jac, cos_jac,
+                                                          torch.zeros_like(cos_jac))
+                                    val_jac_cos_sum += cos_jac.mean().item()
+                                val_jac_batches += 1
+
                     avg_val = val_loss / max(val_batches, 1)
+                    avg_val_jac = val_jac_cos_sum / max(val_jac_batches, 1) if val_jac_batches > 0 else None
+                    avg_val_jac_loss = (1.0 - avg_val_jac) if avg_val_jac is not None else None
+                    if avg_val_jac_loss is not None:
+                        avg_val_total = avg_val + jac_lambda * avg_val_jac_loss
+                    else:
+                        avg_val_total = avg_val
                     epoch_val_losses.append(avg_val)
                     avg_recent = np.mean(
                         step_losses[max(0, len(step_losses) - val_every_steps):])
@@ -1102,22 +1157,29 @@ def main(config: DictConfig):
                         gen_val_str = f" | gen_val={avg_gen_val:.6f}"
                         gen_buffer.refresh()  # restore buffer for training
 
+                    jac_val_str = ""
+                    if avg_val_jac is not None:
+                        jac_val_str = (f" | val_jac_cos={avg_val_jac:.4f}"
+                                       f" | val_jac_loss={avg_val_jac_loss:.4f}"
+                                       f" | val_total={avg_val_total:.6f}")
                     logger.log(f"  VAL @ step {global_step}: "
                                f"train_avg={avg_recent:.6f} | "
-                               f"val={avg_val:.6f}{gen_val_str}")
+                               f"val_mse={avg_val:.6f}{jac_val_str}{gen_val_str}")
 
-                    is_best = avg_val < best_val_loss
+                    is_best = avg_val_total < best_val_loss
                     if is_best:
-                        best_val_loss = avg_val
+                        best_val_loss = avg_val_total
                         save_classifier(
                             classifier,
                             str(root / "classifier_best.pt"),
                             metadata={"step": global_step,
                                       "val_loss": avg_val,
+                                      "val_jac_cos": avg_val_jac,
+                                      "val_total": avg_val_total,
                                       "best_val_loss": best_val_loss,
                                       "target_mode": target_mode,
                                       "optimizer_state_dict": optimizer.state_dict()})
-                        logger.log(f"  -> New best val_loss={avg_val:.6f}")
+                        logger.log(f"  -> New best val_total={avg_val_total:.6f}")
 
                     classifier.train()
                     save_loss_curves(step_losses, epoch_train_losses,
