@@ -757,6 +757,152 @@ class UNetSurrogate(nn.Module):
         return self.head(h)       # [B, meas_flat_dim]
 
 
+class GradientPredictor(nn.Module):
+    """Image-to-image UNet that directly predicts the guidance gradient.
+
+    Maps (denoised, y, sigma) → ∇_denoised ||A(denoised) - y||²,
+    an image-shaped gradient [B, img_channels, H, W].
+
+    Uses FiLM sigma conditioning (via ResBlock) because gradient magnitude
+    depends heavily on the noise level. MeasurementEncoder projects y into
+    spatial features that are concatenated channel-wise with denoised.
+
+    At inference the predicted gradient is used directly — no autograd needed,
+    making sampling much cheaper than DPS.
+    """
+
+    def __init__(self, img_resolution=128, img_channels=1,
+                 obs_shape=(20, 360), y_channels=4,
+                 base_channels=64, channel_mult=(1, 2, 4, 4),
+                 emb_dim=256, attn_heads=4,
+                 num_res_blocks=2, dropout=0.0):
+        super().__init__()
+        self.img_resolution = img_resolution
+        self.img_channels = img_channels
+        self.obs_shape = obs_shape
+        self.y_channels = y_channels
+        self.base_channels = base_channels
+        self.channel_mult = list(channel_mult)
+        self.emb_dim = emb_dim
+        self.attn_heads = attn_heads
+        self.num_res_blocks = num_res_blocks
+        self.dropout_rate = dropout
+
+        C = base_channels
+        ch_list = [C * m for m in channel_mult]
+        bot_ch = ch_list[-1]
+        cat_ch = img_channels + y_channels  # denoised + encoded y
+
+        # --- Measurement encoder (y → spatial features) ---
+        self.measurement_encoder = MeasurementEncoder(
+            obs_shape, y_channels, img_resolution, enc_spatial_size=32)
+
+        # --- Sigma embedding (FiLM conditioning) ---
+        self.sigma_mlp = nn.Sequential(
+            nn.Linear(emb_dim, emb_dim),
+            nn.SiLU(),
+            nn.Linear(emb_dim, emb_dim),
+        )
+
+        # --- Input conv ---
+        self.input_conv = nn.Conv2d(cat_ch, C, 3, padding=1)
+
+        # --- Encoder ---
+        self.enc_blocks = nn.ModuleList()
+        self.downsamples = nn.ModuleList()
+        prev_ch = C
+        for cur_ch in ch_list:
+            level_blocks = nn.ModuleList()
+            for j in range(num_res_blocks):
+                level_blocks.append(ResBlock(
+                    prev_ch if j == 0 else cur_ch, cur_ch, emb_dim))
+            self.enc_blocks.append(level_blocks)
+            self.downsamples.append(nn.Conv2d(cur_ch, cur_ch, 3, stride=2, padding=1))
+            prev_ch = cur_ch
+
+        # --- Bottleneck ---
+        self.bot_res1 = ResBlock(bot_ch, bot_ch, emb_dim)
+        self.bot_attn = SelfAttention(bot_ch, num_heads=attn_heads)
+        self.bot_res2 = ResBlock(bot_ch, bot_ch, emb_dim)
+
+        # --- Decoder ---
+        self.upsample_layers = nn.ModuleList()
+        self.dec_blocks = nn.ModuleList()
+        dec_prev_ch = bot_ch
+        for i in reversed(range(len(channel_mult))):
+            skip_ch = ch_list[i]
+            dec_out_ch = ch_list[i - 1] if i > 0 else C
+            self.upsample_layers.append(nn.Upsample(scale_factor=2, mode='nearest'))
+            level_blocks = nn.ModuleList()
+            for j in range(num_res_blocks):
+                in_ch = (dec_prev_ch + skip_ch) if j == 0 else dec_out_ch
+                level_blocks.append(ResBlock(in_ch, dec_out_ch, emb_dim))
+            self.dec_blocks.append(level_blocks)
+            dec_prev_ch = dec_out_ch
+
+        # --- Output: zero-init so model starts predicting zero gradient ---
+        self.out_norm = nn.GroupNorm(min(32, C), C)
+        self.out_conv = zero_module(nn.Conv2d(C, img_channels, 1))
+
+    def forward(self, x_t, sigma, y, denoised=None):
+        """
+        Args:
+            x_t:      [B, C, H, W] noisy input (unused when denoised provided)
+            sigma:    [B] or scalar noise level
+            y:        [B, ...] raw measurements
+            denoised: [B, C, H, W] Tweedie denoised estimate (preferred)
+
+        Returns:
+            [B, img_channels, H, W] predicted gradient image
+        """
+        img = denoised if denoised is not None else x_t
+        B = img.shape[0]
+
+        # Sigma embedding
+        if not isinstance(sigma, torch.Tensor):
+            sigma_t = torch.tensor([sigma], dtype=torch.float32,
+                                   device=img.device).expand(B)
+        else:
+            sigma_t = sigma.float().view(-1)
+            if sigma_t.numel() == 1:
+                sigma_t = sigma_t.expand(B)
+        emb = timestep_embedding(sigma_t.log(), self.emb_dim)
+        emb = self.sigma_mlp(emb)
+
+        # Encode y → spatial features
+        y_in = self.measurement_encoder(y)
+        if y_in.shape[-2:] != img.shape[-2:]:
+            y_in = F.interpolate(y_in, size=img.shape[-2:],
+                                 mode='bilinear', align_corners=False)
+
+        # Input conv
+        h = self.input_conv(torch.cat([img, y_in], dim=1))
+
+        # Encoder
+        skips = []
+        for level_blocks, down in zip(self.enc_blocks, self.downsamples):
+            for blk in level_blocks:
+                h = blk(h, emb)
+            skips.append(h)
+            h = down(h)
+
+        # Bottleneck
+        h = self.bot_res1(h, emb)
+        h = self.bot_attn(h)
+        h = self.bot_res2(h, emb)
+
+        # Decoder
+        for up, level_blocks in zip(self.upsample_layers, self.dec_blocks):
+            h = up(h)
+            h = torch.cat([h, skips.pop()], dim=1)
+            for blk in level_blocks:
+                h = blk(h, emb)
+
+        # Output
+        h = F.silu(self.out_norm(h))
+        return self.out_conv(h)
+
+
 # ---------------------------------------------------------------------------
 # Measurement encoder (for non-image observations)
 # ---------------------------------------------------------------------------
@@ -1340,7 +1486,32 @@ def save_classifier(classifier, path, metadata=None):
     Dispatches on architecture type: 'surrogate' (ForwardSurrogate),
     'transformer' (TransformerCBG), or 'unet' (MeasurementPredictor).
     """
-    if isinstance(classifier, UNetSurrogate):
+    if isinstance(classifier, GradientPredictor):
+        config = {
+            'arch': 'grad_predictor',
+            'img_resolution': classifier.img_resolution,
+            'img_channels': classifier.img_channels,
+            'obs_shape': list(classifier.obs_shape),
+            'y_channels': classifier.y_channels,
+            'base_channels': classifier.base_channels,
+            'channel_mult': list(classifier.channel_mult),
+            'emb_dim': classifier.emb_dim,
+            'attn_heads': classifier.attn_heads,
+            'num_res_blocks': classifier.num_res_blocks,
+            'dropout': classifier.dropout_rate,
+        }
+        checkpoint = {
+            'state_dict': classifier.state_dict(),
+            'config': config,
+        }
+        # Save encoder build info for lazy MeasurementEncoder
+        if classifier.measurement_encoder._built:
+            checkpoint['meas_enc_in_dim'] = classifier.measurement_encoder._in_dim
+        if metadata:
+            checkpoint.update(metadata)
+        torch.save(checkpoint, path)
+        return
+    elif isinstance(classifier, UNetSurrogate):
         config = {
             'arch': 'unet_surrogate',
             'img_resolution': classifier.img_resolution,
@@ -1471,6 +1642,20 @@ def load_classifier(path, device='cuda'):
     config = dict(checkpoint['config'])
 
     arch = config.pop('arch', 'unet')
+
+    if arch == 'grad_predictor':
+        if 'obs_shape' in config:
+            config['obs_shape'] = tuple(config['obs_shape'])
+        if 'channel_mult' in config:
+            config['channel_mult'] = tuple(config['channel_mult'])
+        classifier = GradientPredictor(**config).to(device)
+        # Rebuild lazy MeasurementEncoder before loading state_dict
+        if 'meas_enc_in_dim' in checkpoint:
+            classifier.measurement_encoder._build(
+                checkpoint['meas_enc_in_dim'], device)
+        classifier.load_state_dict(checkpoint['state_dict'])
+        classifier.eval()
+        return classifier
 
     if arch == 'fno':
         if 'obs_shape' in config:

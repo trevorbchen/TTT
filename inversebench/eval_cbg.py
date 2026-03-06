@@ -42,7 +42,7 @@ _repo_root = str(Path(__file__).resolve().parent)
 if _repo_root not in sys.path:
     sys.path.insert(0, _repo_root)
 
-from classifier import load_classifier
+from classifier import load_classifier, GradientPredictor
 from utils.helper import open_url
 from utils.scheduler import Scheduler
 
@@ -164,6 +164,53 @@ def cbg_sample(net, classifier, forward_op, observation, scheduler,
 
             if torch.isnan(x).any():
                 break
+
+    return x
+
+
+# ---------------------------------------------------------------------------
+# Gradient predictor sampling (no autograd at inference)
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def grad_pred_sample(net, classifier, observation, scheduler,
+                     guidance_scale=1.0, device='cuda'):
+    """Single-sample reconstruction using a GradientPredictor.
+
+    The classifier directly predicts the guidance gradient image, so no
+    autograd is needed at inference — just forward passes through net and
+    classifier.
+    """
+    obs = observation  # [1, ...]
+
+    x = torch.randn(
+        1, net.img_channels, net.img_resolution, net.img_resolution,
+        device=device
+    ) * scheduler.sigma_max
+
+    for i in range(scheduler.num_steps):
+        sigma = scheduler.sigma_steps[i]
+        scaling = scheduler.scaling_steps[i]
+        factor = scheduler.factor_steps[i]
+        scaling_factor = scheduler.scaling_factor[i]
+        sigma_t = torch.as_tensor(sigma).to(device)
+
+        denoised = net(x / scaling, sigma_t)
+        pred_grad = classifier(x / scaling, sigma_t, obs, denoised=denoised)
+
+        # Normalize by gradient norm for stable guidance
+        gnorm = pred_grad.flatten(1).norm(dim=-1).clamp(min=1e-8)
+        normalized_grad = pred_grad / gnorm.view(-1, 1, 1, 1)
+
+        # PF-ODE Euler step
+        score = (denoised - x / scaling) / sigma ** 2 / scaling
+        x = x * scaling_factor + factor * score * 0.5
+
+        # Apply guidance
+        x = x - guidance_scale * normalized_grad
+
+        if torch.isnan(x).any():
+            break
 
     return x
 
@@ -409,10 +456,13 @@ def main(config: DictConfig):
     num_params = sum(p.numel() for p in classifier.parameters())
     print(f"  Classifier: {num_params/1e6:.2f}M params")
 
-    # Load target_mode from checkpoint metadata (default: tweedie for backward compat)
+    # Detect architecture and target_mode from checkpoint metadata
     ckpt_meta = torch.load(classifier_path, map_location='cpu', weights_only=False)
     target_mode = ckpt_meta.get("target_mode", "tweedie")
+    is_grad_pred = isinstance(classifier, GradientPredictor)
     print(f"  Target mode: {target_mode}")
+    if is_grad_pred:
+        print(f"  Architecture: GradientPredictor (no-autograd inference)")
     del ckpt_meta
 
     # --- Build scheduler ---
@@ -463,9 +513,13 @@ def main(config: DictConfig):
 
         # Seed for reproducibility (same noise for CBG and DPS)
         torch.manual_seed(42 + idx)
-        recon = cbg_sample(net, classifier, forward_op, y_i, scheduler,
-                           guidance_scale=guidance_scale, device=device,
-                           target_mode=target_mode)
+        if is_grad_pred:
+            recon = grad_pred_sample(net, classifier, y_i, scheduler,
+                                     guidance_scale=guidance_scale, device=device)
+        else:
+            recon = cbg_sample(net, classifier, forward_op, y_i, scheduler,
+                               guidance_scale=guidance_scale, device=device,
+                               target_mode=target_mode)
 
         err = relative_measurement_error(forward_op, recon, y_i)
         cbg_losses.append(err)

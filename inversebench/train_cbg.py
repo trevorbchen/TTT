@@ -43,7 +43,7 @@ _repo_root = str(Path(__file__).resolve().parent)
 if _repo_root not in sys.path:
     sys.path.insert(0, _repo_root)
 
-from classifier import MeasurementPredictor, TransformerCBG, ForwardSurrogate, FNOSurrogate, UNetSurrogate, save_classifier
+from classifier import MeasurementPredictor, TransformerCBG, ForwardSurrogate, FNOSurrogate, UNetSurrogate, GradientPredictor, save_classifier
 from utils.helper import open_url
 
 
@@ -310,10 +310,13 @@ def evaluate_held_out(classifier, net, forward_op, eval_images,
 
         if target_mode in ("tweedie", "forward"):
             denoised = net(x_noisy, sigma)
-            y_hat = forward_op({'target': denoised})
+            # forward_op may not batch — apply per-sample
+            y_hat = torch.cat([forward_op({'target': denoised[j:j+1]})
+                               for j in range(B)])
         else:  # direct
             denoised = None
-            y_hat = forward_op({'target': x_noisy})
+            y_hat = torch.cat([forward_op({'target': x_noisy[j:j+1]})
+                               for j in range(B)])
         if target_mode == "forward":
             raw_target = y_hat
         else:
@@ -416,6 +419,7 @@ def main(config: DictConfig):
     # Jacobian matching loss
     jac_loss      = cbg.get("jac_loss", False)
     jac_lambda    = cbg.get("jac_lambda", 1.0)
+    grad_normalize_target = cbg.get("grad_normalize_target", False)
     # On-the-fly diffusion prior sampling
     gen_samples          = cbg.get("gen_samples", False)
     gen_buffer_size      = cbg.get("gen_buffer_size", 128)
@@ -424,8 +428,8 @@ def main(config: DictConfig):
     gen_mix_ratio        = cbg.get("gen_mix_ratio", 1.0)
     assert target_mode in ("tweedie", "direct", "forward"), \
         f"Unknown target_mode={target_mode!r}, expected 'tweedie', 'direct', or 'forward'"
-    assert arch in ("unet", "transformer", "surrogate", "fno", "unet_surrogate"), \
-        f"Unknown arch={arch!r}, expected 'unet', 'transformer', 'surrogate', 'fno', or 'unet_surrogate'"
+    assert arch in ("unet", "transformer", "surrogate", "fno", "unet_surrogate", "grad_predictor"), \
+        f"Unknown arch={arch!r}, expected 'unet', 'transformer', 'surrogate', 'fno', 'unet_surrogate', or 'grad_predictor'"
     assert loss_type in ("mse", "cosine"), \
         f"Unknown loss_type={loss_type!r}, expected 'mse' or 'cosine'"
 
@@ -588,6 +592,26 @@ def main(config: DictConfig):
         logger.log(f"UNetSurrogate: {num_params/1e6:.2f}M parameters")
         logger.log(f"  UNet: ch={base_channels}, mult={channel_mult}, "
                    f"res_blocks={num_res_blocks}, dropout={t_dropout}")
+    elif arch == "grad_predictor":
+        assert not is_image_obs, "GradientPredictor requires non-image observations"
+        classifier = GradientPredictor(
+            img_resolution=net.img_resolution,
+            img_channels=net.img_channels,
+            obs_shape=obs_shape,
+            y_channels=y_channels,
+            base_channels=base_channels,
+            channel_mult=channel_mult,
+            emb_dim=emb_dim,
+            attn_heads=attn_heads,
+            num_res_blocks=num_res_blocks,
+            dropout=t_dropout,
+        ).to(device)
+        num_params = sum(p.numel() for p in classifier.parameters())
+        logger.log(f"GradientPredictor: {num_params/1e6:.2f}M parameters")
+        logger.log(f"  UNet: ch={base_channels}, mult={channel_mult}, "
+                   f"res_blocks={num_res_blocks}, emb_dim={emb_dim}, dropout={t_dropout}")
+        if grad_normalize_target:
+            logger.log(f"  Gradient target normalization: ENABLED")
     elif arch == "fno":
         assert not is_image_obs, "FNOSurrogate requires non-image observations"
         classifier = FNOSurrogate(
@@ -724,6 +748,7 @@ def main(config: DictConfig):
 
     classifier.train()
     t_pass = time.time()
+    is_grad_pred = isinstance(classifier, GradientPredictor)
 
     pbar = tqdm.tqdm(all_indices, desc="Training")
 
@@ -746,45 +771,75 @@ def main(config: DictConfig):
                 eps = torch.randn(B, *x0.shape[1:], device=device)
                 x_noisy = x0_rep + sigma_bc * eps
 
-                with torch.no_grad():
-                    if target_mode == "tweedie":
+                if is_grad_pred:
+                    # --- GradientPredictor: target is true gradient ---
+                    with torch.no_grad():
                         denoised = net(x_noisy, sigma)
-                        y_hat = forward_op({'target': denoised})
-                    elif target_mode == "forward":
-                        denoised = net(x_noisy, sigma)
-                        y_hat = forward_op({'target': denoised})
-                    else:  # direct
-                        denoised = None
-                        y_hat = forward_op({'target': x_noisy})
-                    # Target: residual (tweedie/direct) or forward prediction
-                    if target_mode == "forward":
-                        raw_target = y_hat  # predict A(denoised) directly
+                    # Compute true gradient: ∇_denoised ||A(denoised) - y||²
+                    denoised_g = denoised.detach().requires_grad_(True)
+                    # forward_op doesn't batch — apply per-sample
+                    y_hat_list = [forward_op({'target': denoised_g[j:j+1]})
+                                  for j in range(B)]
+                    y_hat = torch.cat(y_hat_list)
+                    residual = y_hat - y_rep
+                    if residual.is_complex():
+                        loss_fwd = torch.view_as_real(residual).pow(2).flatten(1).sum(-1)
                     else:
-                        raw_target = y_hat - y_rep  # predict residual
-                    # Flatten to measurement space
-                    if hasattr(classifier, 'measurement_decoder') and classifier.measurement_decoder is not None:
-                        if raw_target.is_complex():
-                            target = torch.view_as_real(raw_target).flatten(1).float()
-                        else:
-                            target = raw_target.flatten(1).float()
-                    elif isinstance(classifier, (TransformerCBG, ForwardSurrogate, FNOSurrogate, UNetSurrogate)):
-                        if raw_target.is_complex():
-                            target = torch.view_as_real(raw_target).flatten(1).float()
-                        else:
-                            target = raw_target.flatten(1).float()
-                    else:
-                        target = raw_target
-                    # Scalar target: ||residual||² (1 dim)
-                    if t_scalar_output:
-                        target = target.pow(2).flatten(1).sum(-1, keepdim=True)  # [B, 1]
-                    elif normalize_target:
-                        tnorm = target.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-                        target = target / tnorm
+                        loss_fwd = residual.pow(2).flatten(1).sum(-1)
+                    grad_true = torch.autograd.grad(
+                        loss_fwd.sum(), denoised_g, create_graph=False)[0].detach()
+                    # [B, img_channels, H, W]
+                    target = grad_true
+                    if grad_normalize_target:
+                        gnorm = target.flatten(1).norm(dim=-1, keepdim=True).clamp(min=1e-8)
+                        target = target / gnorm.view(-1, 1, 1, 1)
 
-                pred = classifier(x_noisy, sigma,
-                                  None if target_mode == "forward" else y_rep,
-                                  denoised=denoised if (use_tweedie_input or target_mode == "forward") else None)
-                if t_scalar_output:
+                    pred = classifier(x_noisy, sigma, y_rep, denoised=denoised)
+                    # MSE loss on gradient images
+                    per_sample_loss = (pred - target).pow(2).flatten(1).sum(-1)  # [B]
+
+                else:
+                    with torch.no_grad():
+                        if target_mode == "tweedie":
+                            denoised = net(x_noisy, sigma)
+                            y_hat = forward_op({'target': denoised})
+                        elif target_mode == "forward":
+                            denoised = net(x_noisy, sigma)
+                            y_hat = forward_op({'target': denoised})
+                        else:  # direct
+                            denoised = None
+                            y_hat = forward_op({'target': x_noisy})
+                        # Target: residual (tweedie/direct) or forward prediction
+                        if target_mode == "forward":
+                            raw_target = y_hat  # predict A(denoised) directly
+                        else:
+                            raw_target = y_hat - y_rep  # predict residual
+                        # Flatten to measurement space
+                        if hasattr(classifier, 'measurement_decoder') and classifier.measurement_decoder is not None:
+                            if raw_target.is_complex():
+                                target = torch.view_as_real(raw_target).flatten(1).float()
+                            else:
+                                target = raw_target.flatten(1).float()
+                        elif isinstance(classifier, (TransformerCBG, ForwardSurrogate, FNOSurrogate, UNetSurrogate)):
+                            if raw_target.is_complex():
+                                target = torch.view_as_real(raw_target).flatten(1).float()
+                            else:
+                                target = raw_target.flatten(1).float()
+                        else:
+                            target = raw_target
+                        # Scalar target: ||residual||² (1 dim)
+                        if t_scalar_output:
+                            target = target.pow(2).flatten(1).sum(-1, keepdim=True)  # [B, 1]
+                        elif normalize_target:
+                            tnorm = target.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+                            target = target / tnorm
+
+                    pred = classifier(x_noisy, sigma,
+                                      None if target_mode == "forward" else y_rep,
+                                      denoised=denoised if (use_tweedie_input or target_mode == "forward") else None)
+                if is_grad_pred:
+                    pass  # per_sample_loss already set above
+                elif t_scalar_output:
                     # Scalar output: always MSE loss
                     per_sample_loss = (pred - target).pow(2).squeeze(-1)  # [B]
                 elif loss_type == "cosine":
@@ -809,10 +864,11 @@ def main(config: DictConfig):
                 # --- Jacobian matching loss ---
                 jac_match_loss = torch.tensor(0.0, device=device)
                 jac_cos_sim_val = 0.0
-                if jac_loss and target_mode == "forward" and denoised is not None:
-                    # True operator gradient
+                if jac_loss and not is_grad_pred and target_mode == "forward" and denoised is not None:
+                    # True operator gradient (forward_op doesn't batch)
                     denoised_jac = denoised.detach().requires_grad_(True)
-                    y_hat_true = forward_op({'target': denoised_jac})
+                    y_hat_true = torch.cat([forward_op({'target': denoised_jac[j:j+1]})
+                                            for j in range(B)])
                     if y_hat_true.is_complex():
                         y_hat_true_real = torch.view_as_real(y_hat_true)
                     else:
@@ -892,7 +948,8 @@ def main(config: DictConfig):
                     classifier.eval()
                     val_loss = 0.0
                     val_batches = 0
-                    with torch.no_grad():
+                    if is_grad_pred:
+                        # GradientPredictor validation: gradient cosine similarity
                         for v_st in range(0, n_val, batch_size):
                             x0v = eval_images[v_st:v_st+batch_size]
                             y_bv = eval_measurements[v_st:v_st+batch_size]
@@ -901,49 +958,84 @@ def main(config: DictConfig):
                             sv_bc = sv.view(-1, 1, 1, 1)
                             epsv = torch.randn_like(x0v)
                             x_nv = x0v + sv_bc * epsv
-                            if target_mode in ("tweedie", "forward"):
+                            with torch.no_grad():
                                 dv = net(x_nv, sv)
-                                y_hv = forward_op({'target': dv})
+                            # True gradient (needs autograd)
+                            dv_g = dv.detach().requires_grad_(True)
+                            y_hv = torch.cat([forward_op({'target': dv_g[j:j+1]})
+                                              for j in range(Bv)])
+                            res_v = y_hv - y_bv
+                            if res_v.is_complex():
+                                loss_v = torch.view_as_real(res_v).pow(2).flatten(1).sum(-1)
                             else:
-                                dv = None
-                                y_hv = forward_op({'target': x_nv})
-                            if target_mode == "forward":
-                                raw_tv = y_hv
-                            else:
-                                raw_tv = y_hv - y_bv
-                            if hasattr(classifier, 'measurement_decoder') and classifier.measurement_decoder is not None:
-                                if raw_tv.is_complex():
-                                    tv = torch.view_as_real(raw_tv).flatten(1).float()
-                                else:
-                                    tv = raw_tv.flatten(1).float()
-                            elif isinstance(classifier, (TransformerCBG, ForwardSurrogate, FNOSurrogate, UNetSurrogate)):
-                                if raw_tv.is_complex():
-                                    tv = torch.view_as_real(raw_tv).flatten(1).float()
-                                else:
-                                    tv = raw_tv.flatten(1).float()
-                            else:
-                                tv = raw_tv
-                            if t_scalar_output:
-                                tv = tv.pow(2).flatten(1).sum(-1, keepdim=True)
-                            elif normalize_target:
-                                tn = tv.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-                                tv = tv / tn
-                            pv = classifier(x_nv, sv,
-                                            None if target_mode == "forward" else y_bv,
-                                            denoised=dv if (use_tweedie_input or target_mode == "forward") else None)
-                            if t_scalar_output:
-                                val_loss += (pv - tv).pow(2).squeeze(-1).mean().item()
-                            elif loss_type == "cosine":
-                                tv_norm = tv.norm(dim=-1)
-                                valid_v = tv_norm > cosine_eps
-                                cos_v = F.cosine_similarity(pv, tv, dim=-1)
-                                per_v = 1.0 - cos_v
-                                per_v = torch.where(valid_v, per_v,
-                                                    torch.zeros_like(per_v))
+                                loss_v = res_v.pow(2).flatten(1).sum(-1)
+                            grad_true_v = torch.autograd.grad(
+                                loss_v.sum(), dv_g, create_graph=False)[0].detach()
+                            with torch.no_grad():
+                                pv = classifier(x_nv, sv, y_bv, denoised=dv)
+                                cos_v = F.cosine_similarity(
+                                    pv.flatten(1), grad_true_v.flatten(1), dim=-1)
+                                valid_v = grad_true_v.flatten(1).norm(dim=-1) > 1e-6
+                                per_v = torch.where(valid_v, 1.0 - cos_v,
+                                                    torch.zeros_like(cos_v))
                                 val_loss += per_v.mean().item()
-                            else:
-                                val_loss += (pv - tv).pow(2).flatten(1).sum(-1).mean().item()
                             val_batches += 1
+                    else:
+                        with torch.no_grad():
+                            for v_st in range(0, n_val, batch_size):
+                                x0v = eval_images[v_st:v_st+batch_size]
+                                y_bv = eval_measurements[v_st:v_st+batch_size]
+                                Bv = x0v.shape[0]
+                                sv = sample_sigma(net, Bv, device)
+                                sv_bc = sv.view(-1, 1, 1, 1)
+                                epsv = torch.randn_like(x0v)
+                                x_nv = x0v + sv_bc * epsv
+                                if target_mode in ("tweedie", "forward"):
+                                    dv = net(x_nv, sv)
+                                    # forward_op may not batch — apply per-sample
+                                    y_hv = torch.cat([forward_op({'target': dv[j:j+1]})
+                                                      for j in range(Bv)])
+                                else:
+                                    dv = None
+                                    y_hv = torch.cat([forward_op({'target': x_nv[j:j+1]})
+                                                      for j in range(Bv)])
+                                if target_mode == "forward":
+                                    raw_tv = y_hv
+                                else:
+                                    raw_tv = y_hv - y_bv
+                                if hasattr(classifier, 'measurement_decoder') and classifier.measurement_decoder is not None:
+                                    if raw_tv.is_complex():
+                                        tv = torch.view_as_real(raw_tv).flatten(1).float()
+                                    else:
+                                        tv = raw_tv.flatten(1).float()
+                                elif isinstance(classifier, (TransformerCBG, ForwardSurrogate, FNOSurrogate, UNetSurrogate)):
+                                    if raw_tv.is_complex():
+                                        tv = torch.view_as_real(raw_tv).flatten(1).float()
+                                    else:
+                                        tv = raw_tv.flatten(1).float()
+                                else:
+                                    tv = raw_tv
+                                if t_scalar_output:
+                                    tv = tv.pow(2).flatten(1).sum(-1, keepdim=True)
+                                elif normalize_target:
+                                    tn = tv.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+                                    tv = tv / tn
+                                pv = classifier(x_nv, sv,
+                                                None if target_mode == "forward" else y_bv,
+                                                denoised=dv if (use_tweedie_input or target_mode == "forward") else None)
+                                if t_scalar_output:
+                                    val_loss += (pv - tv).pow(2).squeeze(-1).mean().item()
+                                elif loss_type == "cosine":
+                                    tv_norm = tv.norm(dim=-1)
+                                    valid_v = tv_norm > cosine_eps
+                                    cos_v = F.cosine_similarity(pv, tv, dim=-1)
+                                    per_v = 1.0 - cos_v
+                                    per_v = torch.where(valid_v, per_v,
+                                                        torch.zeros_like(per_v))
+                                    val_loss += per_v.mean().item()
+                                else:
+                                    val_loss += (pv - tv).pow(2).flatten(1).sum(-1).mean().item()
+                                val_batches += 1
                     avg_val = val_loss / max(val_batches, 1)
                     epoch_val_losses.append(avg_val)
                     avg_recent = np.mean(
@@ -1033,6 +1125,7 @@ def main(config: DictConfig):
         "num_sigma_steps": num_sigma_steps,
         "sigma_batch_size": sigma_batch_size,
         "total_steps": total_steps,
+        "grad_normalize_target": grad_normalize_target,
     }
     if epoch_train_losses:
         final_meta["final_train_loss"] = epoch_train_losses[-1]

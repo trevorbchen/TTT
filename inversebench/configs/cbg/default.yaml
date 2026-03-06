@@ -1,9 +1,12 @@
 # CBG (Classifier-Based Guidance) training defaults
+#
+# Defaults tuned to match the best result so far:
+#   UNetSurrogate, gen-only data, forward target, MSE loss, no SNR → 45.3% RME
 
-# Architecture selection: "unet" (MeasurementPredictor) or "transformer" (TransformerCBG)
-arch: transformer
+# Architecture: "unet_surrogate" (best), "grad_predictor", "unet", "transformer", "surrogate", "fno"
+arch: unet_surrogate
 
-# UNet architecture (used when arch=unet)
+# UNet / UNetSurrogate / GradientPredictor architecture
 base_channels: 64
 channel_mult: [1, 2, 4, 4]
 emb_dim: 256
@@ -33,13 +36,16 @@ fno_mlp_ratio: 2
 jac_loss: false
 jac_lambda: 1.0
 
+# Gradient predictor: normalize targets to unit norm (learn direction only)
+grad_normalize_target: false
+
 # Sigma curriculum: only train on sigma in [min, max]
 # 0/1000 = no filtering (use all sigma levels)
 sigma_min_curriculum: 0.0
 sigma_max_curriculum: 1000.0
 
 # Loss: "mse" or "cosine"
-loss_type: cosine
+loss_type: mse
 cosine_eps: 1e-6
 
 # Training
@@ -51,28 +57,28 @@ grad_clip: 10.0
 #   For each sample, iterate through ALL sigma levels (single pass).
 num_sigma_steps: 200    # number of discrete VP sigma levels
 sigma_batch_size: 8     # sigma levels batched per optimizer step
-num_passes: 1           # passes through the dataset
-val_every_steps: 500    # validate every N optimizer steps
-save_every_steps: 2000  # checkpoint every N steps
+num_passes: 50          # passes through the dataset
+val_every_steps: 5000   # validate every N optimizer steps
+save_every_steps: 50000 # checkpoint every N steps
 
 # Min-SNR-gamma loss weighting (Kingma/Hang et al.)
 #   Upweights low-noise (fine detail) steps, downweights high-noise (coarse).
 #   w(sigma) = min(1/sigma^2, gamma). Set 0 to disable.
-snr_gamma: 5.0
+snr_gamma: 0
 
 # Data
-train_pct: 10
+train_pct: 80
 val_fraction: 0.1
 
 # Target
-target_mode: tweedie    # "tweedie" or "direct"
-normalize_target: false  # cosine loss handles scale-invariance
+target_mode: forward    # "forward" (best), "tweedie", or "direct"
+normalize_target: false
 
 # On-the-fly diffusion prior sampling
-gen_samples: false           # enable synthetic sample generation
+gen_samples: true            # enable synthetic sample generation
 gen_buffer_size: 128         # number of synthetic samples in buffer
 gen_batch_size: 8            # parallel diffusion samples per generation call
-gen_steps: 50                # diffusion steps for generation (fewer = faster, 50 is fine)
+gen_steps: 200               # diffusion steps for generation
 gen_mix_ratio: 1.0           # fraction using generated data (1.0 = all gen, 0.5 = half/half)
 
 # Output
