@@ -894,45 +894,52 @@ def main(config: DictConfig):
                     w = torch.ones(B, device=device)
                 forward_loss = (w * per_sample_loss).mean()
 
-                # --- Jacobian matching loss ---
+                # --- Jacobian matching loss (finite difference) ---
                 jac_match_loss = torch.tensor(0.0, device=device)
                 jac_cos_sim_val = 0.0
                 if jac_loss and not is_grad_pred and target_mode == "forward" and denoised is not None:
-                    # True operator gradient (forward_op doesn't batch)
-                    denoised_jac = denoised.detach().requires_grad_(True)
-                    y_hat_true = torch.cat([forward_op({'target': denoised_jac[j:j+1]})
-                                            for j in range(B)])
-                    if y_hat_true.is_complex():
-                        y_hat_true_real = torch.view_as_real(y_hat_true)
-                    else:
-                        y_hat_true_real = y_hat_true
-                    y_flat_for_jac = target.detach()  # [B, meas_flat_dim]
-                    if y_rep.is_complex():
-                        y_rep_flat = torch.view_as_real(y_rep).flatten(1).float()
-                    else:
-                        y_rep_flat = y_rep.flatten(1).float()
-                    loss_true = (y_hat_true_real.flatten(1).float() - y_rep_flat).pow(2).sum(-1)
-                    grad_true = torch.autograd.grad(
-                        loss_true.sum(), denoised_jac,
-                        create_graph=False)[0].detach()
+                    jac_eps = 1e-3
+                    n_jac_dirs = 2  # random directions to average over
+                    jac_cos_accum = 0.0
+                    jac_loss_accum = torch.tensor(0.0, device=device)
+                    denoised_d = denoised.detach()
 
-                    # Surrogate gradient (create_graph=True to backprop through cos_sim)
-                    denoised_jac2 = denoised.detach().requires_grad_(True)
-                    pred_surr = classifier(denoised_jac2, sigma, None,
-                                           denoised=denoised_jac2)
-                    loss_surr = (pred_surr - y_rep_flat).pow(2).sum(-1)
-                    grad_surr = torch.autograd.grad(
-                        loss_surr.sum(), denoised_jac2,
-                        create_graph=True)[0]
+                    for _jd in range(n_jac_dirs):
+                        # Random perturbation direction (unit norm per sample)
+                        delta = torch.randn_like(denoised_d)
+                        delta = delta / delta.flatten(1).norm(dim=1, keepdim=True).view(-1, 1, 1, 1).clamp(min=1e-8)
+                        delta = delta * jac_eps
 
-                    # Cosine similarity loss
-                    cos_sim_jac = F.cosine_similarity(
-                        grad_surr.flatten(1), grad_true.flatten(1), dim=-1)
-                    valid_jac = grad_true.flatten(1).norm(dim=-1) > 1e-6
-                    jac_match_loss = torch.where(
-                        valid_jac, 1.0 - cos_sim_jac,
-                        torch.zeros_like(cos_sim_jac)).mean()
-                    jac_cos_sim_val = cos_sim_jac[valid_jac].mean().item() if valid_jac.any() else 0.0
+                        # True directional derivative via finite difference
+                        with torch.no_grad():
+                            A_plus = torch.cat([forward_op({'target': (denoised_d + delta)[j:j+1]})
+                                                for j in range(B)])
+                            A_minus = torch.cat([forward_op({'target': (denoised_d - delta)[j:j+1]})
+                                                 for j in range(B)])
+                            if A_plus.is_complex():
+                                dA = torch.view_as_real(A_plus - A_minus).flatten(1).float() / (2 * jac_eps)
+                            else:
+                                dA = (A_plus - A_minus).flatten(1).float() / (2 * jac_eps)
+
+                        # Surrogate directional derivative (differentiable)
+                        pred_plus = classifier(x_noisy, sigma, None,
+                                               denoised=denoised_d + delta)
+                        pred_minus = classifier(x_noisy, sigma, None,
+                                                denoised=denoised_d - delta)
+                        df = (pred_plus - pred_minus) / (2 * jac_eps)
+
+                        # Cosine similarity between directional derivatives
+                        cos_jd = F.cosine_similarity(
+                            df.flatten(1), dA, dim=-1)
+                        valid_jd = dA.norm(dim=-1) > 1e-6
+                        jac_dir_loss = torch.where(
+                            valid_jd, 1.0 - cos_jd,
+                            torch.zeros_like(cos_jd)).mean()
+                        jac_loss_accum = jac_loss_accum + jac_dir_loss
+                        jac_cos_accum += cos_jd[valid_jd].mean().item() if valid_jd.any() else 0.0
+
+                    jac_match_loss = jac_loss_accum / n_jac_dirs
+                    jac_cos_sim_val = jac_cos_accum / n_jac_dirs
 
                 loss = forward_loss + jac_lambda * jac_match_loss
 
