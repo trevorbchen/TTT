@@ -1044,7 +1044,7 @@ def main(config: DictConfig):
 
                     # Gen-domain validation: evaluate on fresh diffusion samples
                     gen_val_str = ""
-                    if gen_buffer is not None:
+                    if gen_buffer is not None and not is_grad_pred:
                         gen_val_loss = 0.0
                         gen_val_batches = 0
                         with torch.no_grad():
