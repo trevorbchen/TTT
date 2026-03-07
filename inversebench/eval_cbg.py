@@ -470,9 +470,10 @@ def main(config: DictConfig):
                  "timestep": "vp", "scaling": "vp"}
     scheduler = Scheduler(**sched_cfg)
 
-    # --- Select test samples (fixed seed for reproducibility) ---
+    # --- Select test samples ---
+    seed = ev.get("seed", 42)
     N = len(test_dataset)
-    rng = np.random.RandomState(42)
+    rng = np.random.RandomState(seed)
     test_indices = rng.choice(N, size=min(num_test, N), replace=False)
     print(f"\nSelected {len(test_indices)} test samples from {N} total")
 
