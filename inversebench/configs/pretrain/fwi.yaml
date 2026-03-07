@@ -1,6 +1,6 @@
 data:
   _target_: training.dataset.LMDBData
-  root: ../data/fwi-train
+  root: /overflow/trevor/data/fwi-train
   resolution: 128
   raw_resolution: 70
   std: 500.0

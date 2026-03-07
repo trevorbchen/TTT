@@ -43,7 +43,9 @@ _repo_root = str(Path(__file__).resolve().parent.parent)
 if _repo_root not in sys.path:
     sys.path.insert(0, _repo_root)
 
-from classifier import MeasurementPredictor, TransformerCBG, ForwardSurrogate, FNOSurrogate, UNetSurrogate, GradientPredictor, save_classifier
+from classifier import (MeasurementPredictor, TransformerCBG, ForwardSurrogate,
+                        FNOSurrogate, UNetSurrogate, GradientPredictor,
+                        MRIUNetSurrogate, save_classifier)
 from utils.helper import open_url
 
 
@@ -122,6 +124,104 @@ def get_vp_sigma_steps(num_steps, beta_max=20, beta_min=0.1, epsilon=1e-5):
 # ---------------------------------------------------------------------------
 # Data loading (same pattern as train_ttt.py)
 # ---------------------------------------------------------------------------
+
+class FWIDiffusionPriorBuffer:
+    """Online FWI buffer: generates x_gt from diffusion prior, computes migration image.
+
+    For each x_gt sampled from the prior:
+      1. forward_op({'target': x_gt})          → shots (seismic observation, ~9s)
+      2. forward_op.gradient(x_zero, shots)    → y_mig [1,C,H,W] migration image (~12s)
+      3. Store (x_gt, y_mig) as CPU tensors
+
+    sample() returns (x_gt, y_mig): x_gt is the clean image, y_mig is the
+    migration image that serves as both the observation and training target.
+    The surrogate learns: x → migration(x), so ∇_x ||surrogate(x) - y_mig_obs||²
+    gives guidance at inference without running Devito.
+    """
+
+    def __init__(self, net, forward_op, device,
+                 buffer_size=16, gen_batch_size=4, num_steps=200):
+        self.net = net
+        self.forward_op = forward_op
+        self.device = device
+        self.buffer_size = buffer_size
+        self.gen_batch_size = gen_batch_size
+        self.num_steps = num_steps
+
+        from utils.scheduler import Scheduler
+        self.scheduler = Scheduler(
+            num_steps=num_steps, schedule="vp",
+            timestep="vp", scaling="vp")
+
+        # List of (x0_noisy, y_mig, grad, sigma) — all CPU tensors [1,C,H,W]
+        self._buffer = []
+        self._cursor = 0
+
+    @torch.no_grad()
+    def _sample_batch(self, batch_size):
+        """SDE Euler-Maruyama sampling from diffusion prior."""
+        x = torch.randn(batch_size, self.net.img_channels,
+                        self.net.img_resolution, self.net.img_resolution,
+                        device=self.device) * self.scheduler.sigma_max
+        for i in range(self.num_steps):
+            sigma = self.scheduler.sigma_steps[i]
+            scaling = self.scheduler.scaling_steps[i]
+            factor = self.scheduler.factor_steps[i]
+            scaling_factor = self.scheduler.scaling_factor[i]
+            denoised = self.net(
+                x / scaling, torch.as_tensor(sigma).to(self.device))
+            score = (denoised - x / scaling) / sigma ** 2 / scaling
+            epsilon = torch.randn_like(x)
+            x = (x * scaling_factor + factor * score
+                 + np.sqrt(factor) * epsilon)
+        return x  # [batch_size, C, H, W]
+
+    def _process_one(self, x_gt):
+        """Run Devito for one ground-truth sample → (x_gt_cpu, y_mig_cpu).
+
+        x_gt: [1, C, H, W] on device (normalized velocity, clamped to [-1.8, 1.8])
+        y_mig: migration image = physics-based forward compressed to [1, C, H, W]
+        """
+        shots = self.forward_op({'target': x_gt})
+        x_zero = torch.zeros_like(x_gt)
+        y_mig_tensor, _ = self.forward_op.gradient(
+            x_zero, shots, return_loss=True, unnormalize=True)
+        return x_gt.cpu(), y_mig_tensor.cpu()
+
+    def refresh(self, logger=None):
+        """Sample buffer_size x_gt from prior, compute migration image per sample.
+
+        Rejects samples with any pixel outside [-1.8, 1.8] to preserve the
+        prior distribution (clamping would distort it).
+        """
+        t0 = time.time()
+        self._buffer = []
+        n_rejected = 0
+        while len(self._buffer) < self.buffer_size:
+            bs = min(self.buffer_size - len(self._buffer), self.gen_batch_size)
+            x_gt_batch = self._sample_batch(bs)
+            for j in range(bs):
+                x_gt_j = x_gt_batch[j:j+1]
+                if x_gt_j.abs().max().item() > 1.8:
+                    n_rejected += 1
+                    continue
+                self._buffer.append(self._process_one(x_gt_j))
+        perm = np.random.permutation(len(self._buffer))
+        self._buffer = [self._buffer[k] for k in perm]
+        self._cursor = 0
+        if logger:
+            logger.log(f"  [FWIBuffer] Refreshed {self.buffer_size} samples "
+                       f"({n_rejected} rejected) in {time.time()-t0:.1f}s")
+
+    def sample(self, logger=None):
+        """Next (x_gt, y_mig) pair on device. Cycles buffer; refreshes only when empty."""
+        if len(self._buffer) == 0:
+            self.refresh(logger)
+        idx = self._cursor % len(self._buffer)
+        x_gt, y_mig = self._buffer[idx]
+        self._cursor += 1
+        return x_gt.to(self.device), y_mig.to(self.device)
+
 
 def load_subset(dataset, indices, forward_op, device):
     """Load a subset of images and compute measurements."""
@@ -214,6 +314,110 @@ class DiffusionPriorBuffer:
         idx = self._perm[self._cursor].item()
         self._cursor += 1
         return self.images[idx:idx+1], self.measurements[idx:idx+1]
+
+
+class DiffusionPriorBufferMRI:
+    """Buffer for MRI: stores x0 images from diffusion prior.
+
+    Maps are NOT stored in the buffer — they are large (num_coils × H × W complex)
+    and sampled fresh from the LMDB dataset at each training step to ensure
+    random, diverse map pairing with generated images.
+
+    sample() returns (x0, map_idx) where map_idx is a random LMDB index.
+    The training loop is responsible for loading maps[map_idx] and computing
+    the MVUE target analytically.
+    """
+
+    def __init__(self, net, device, dataset_len,
+                 buffer_size=32, gen_batch_size=4, num_steps=50):
+        self.net = net
+        self.device = device
+        self.dataset_len = dataset_len
+        self.buffer_size = buffer_size
+        self.gen_batch_size = gen_batch_size
+        self.num_steps = num_steps
+
+        from utils.scheduler import Scheduler
+        self.scheduler = Scheduler(
+            num_steps=num_steps, schedule="vp",
+            timestep="vp", scaling="vp")
+
+        self.images = None    # [buffer_size, C, H, W]
+        self._cursor = 0
+        self._perm = None
+
+    @torch.no_grad()
+    def _sample_batch(self, batch_size):
+        """SDE Euler-Maruyama sampling."""
+        x = torch.randn(batch_size, self.net.img_channels,
+                        self.net.img_resolution, self.net.img_resolution,
+                        device=self.device) * self.scheduler.sigma_max
+        for i in range(self.num_steps):
+            sigma = self.scheduler.sigma_steps[i]
+            scaling = self.scheduler.scaling_steps[i]
+            factor = self.scheduler.factor_steps[i]
+            scaling_factor = self.scheduler.scaling_factor[i]
+            denoised = self.net(
+                x / scaling, torch.as_tensor(sigma).to(self.device))
+            score = (denoised - x / scaling) / sigma ** 2 / scaling
+            epsilon = torch.randn_like(x)
+            x = (x * scaling_factor + factor * score
+                 + np.sqrt(factor) * epsilon)
+        return x
+
+    def refresh(self, logger=None):
+        """Regenerate buffer of x0 images (maps sampled at training time)."""
+        t0 = time.time()
+        all_imgs = []
+        remaining = self.buffer_size
+        while remaining > 0:
+            bs = min(remaining, self.gen_batch_size)
+            all_imgs.append(self._sample_batch(bs))
+            remaining -= bs
+        self.images = torch.cat(all_imgs)[:self.buffer_size]
+        self._perm = torch.randperm(self.buffer_size)
+        self._cursor = 0
+        if logger:
+            logger.log(f"  [MRIGenBuffer] Refreshed {self.buffer_size} images "
+                       f"in {time.time()-t0:.1f}s")
+
+    def sample(self, logger=None):
+        """Returns (x0 [1,C,H,W], map_idx int). Auto-refreshes when exhausted."""
+        if self._cursor >= self.buffer_size:
+            self.refresh(logger)
+        idx = self._perm[self._cursor].item()
+        self._cursor += 1
+        # Random LMDB index for maps — different every call for diversity
+        map_idx = int(np.random.randint(0, self.dataset_len))
+        return self.images[idx:idx+1], map_idx
+
+
+# ---------------------------------------------------------------------------
+# MRI utilities
+# ---------------------------------------------------------------------------
+
+def mri_compute_mvue(masked_kspace_real, maps_complex, forward_op_cls):
+    """Compute MVUE from masked kspace (view_as_real) and sensitivity maps.
+
+    MVUE(y, maps) = sum_c( IFFT(y_c) * conj(maps_c) ) / sum_c( |maps_c|^2 )
+
+    Args:
+        masked_kspace_real: [B, nc, H, W, 2] float (output of forward_op.forward)
+        maps_complex:       [B, nc, H, W] complex
+    Returns:
+        [B, 2, H, W] float (real/imag channels of complex MVUE)
+    """
+    from inverse_problems.multi_coil_mri import MultiCoilMRI
+    # [B, nc, H, W] complex
+    masked_kspace = torch.view_as_complex(masked_kspace_real.contiguous())
+    # IFFT each coil image: [B, nc, H, W] complex
+    coil_imgs = MultiCoilMRI.ifft(masked_kspace)
+    # Coil combination
+    numerator = (coil_imgs * maps_complex.conj()).sum(dim=1)   # [B, H, W] complex
+    denominator = (maps_complex.abs() ** 2).sum(dim=1)         # [B, H, W] real
+    mvue = numerator / denominator.clamp(min=1e-10)            # [B, H, W] complex
+    # Return as [B, 2, H, W] real/imag
+    return torch.stack([mvue.real, mvue.imag], dim=1).float()
 
 
 # ---------------------------------------------------------------------------
@@ -422,6 +626,10 @@ def main(config: DictConfig):
     jac_loss      = cbg.get("jac_loss", False)
     jac_lambda    = cbg.get("jac_lambda", 1.0)
     grad_normalize_target = cbg.get("grad_normalize_target", False)
+    # MRI surrogate config
+    mri_num_coils  = cbg.get("num_coils", 15)
+    mri_map_ch     = cbg.get("map_channels", 4)
+    fwi_val_precomputed_dir = cbg.get("fwi_val_precomputed_dir", None)
     # On-the-fly diffusion prior sampling
     gen_samples          = cbg.get("gen_samples", False)
     gen_buffer_size      = cbg.get("gen_buffer_size", 128)
@@ -432,8 +640,9 @@ def main(config: DictConfig):
     resume_from          = cbg.get("resume_from", None)
     assert target_mode in ("tweedie", "direct", "forward"), \
         f"Unknown target_mode={target_mode!r}, expected 'tweedie', 'direct', or 'forward'"
-    assert arch in ("unet", "transformer", "surrogate", "fno", "unet_surrogate", "grad_predictor"), \
-        f"Unknown arch={arch!r}, expected 'unet', 'transformer', 'surrogate', 'fno', 'unet_surrogate', or 'grad_predictor'"
+    assert arch in ("unet", "transformer", "surrogate", "fno", "unet_surrogate",
+                    "grad_predictor", "mri_unet_surrogate", "fwi_surrogate"), \
+        f"Unknown arch={arch!r}"
     assert loss_type in ("mse", "cosine"), \
         f"Unknown loss_type={loss_type!r}, expected 'mse' or 'cosine'"
 
@@ -484,6 +693,9 @@ def main(config: DictConfig):
         yaml.safe_dump(OmegaConf.to_container(config, resolve=True), f,
                        default_flow_style=False)
 
+    is_mri_arch = (arch == "mri_unet_surrogate")
+    is_fwi = (arch == "fwi_surrogate")
+
     # --- 1. Load components ---
     logger.log("Loading forward operator...")
     forward_op = instantiate(config.problem.model, device=device)
@@ -513,14 +725,24 @@ def main(config: DictConfig):
 
     # --- 1b. Diffusion prior buffer (optional) ---
     gen_buffer = None
-    if gen_samples:
+    gen_buffer_mri = None
+    if gen_samples and not is_fwi:
         logger.log(f"Setting up diffusion prior buffer: size={gen_buffer_size}, "
                    f"steps={gen_steps}, batch={gen_batch_size}, mix={gen_mix_ratio}")
-        gen_buffer = DiffusionPriorBuffer(
-            net=net, forward_op=forward_op, device=device,
-            buffer_size=gen_buffer_size, gen_batch_size=gen_batch_size,
-            num_steps=gen_steps)
-        gen_buffer.refresh(logger)
+        if is_mri_arch:
+            # MRI buffer: only stores x0 images; maps sampled at training time
+            gen_buffer_mri = DiffusionPriorBufferMRI(
+                net=net, device=device,
+                dataset_len=len(instantiate(config.pretrain.data)),
+                buffer_size=gen_buffer_size, gen_batch_size=gen_batch_size,
+                num_steps=gen_steps)
+            gen_buffer_mri.refresh(logger)
+        else:
+            gen_buffer = DiffusionPriorBuffer(
+                net=net, forward_op=forward_op, device=device,
+                buffer_size=gen_buffer_size, gen_batch_size=gen_batch_size,
+                num_steps=gen_steps)
+            gen_buffer.refresh(logger)
 
     # --- 2. Train/eval split ---
     N = len(train_dataset)
@@ -536,12 +758,51 @@ def main(config: DictConfig):
     np.savez(str(root / "split_indices.npz"),
              train=train_indices, eval=eval_indices)
 
-    logger.log("Loading train split...")
-    images, measurements = load_subset(train_dataset, train_indices,
-                                       forward_op, device)
-    logger.log(f"  images={images.shape}, measurements={measurements.shape}")
+    if is_mri_arch:
+        # MRI: no preloading — x0 comes from gen_buffer_mri, maps loaded per-step
+        images = measurements = None
+        logger.log("MRI mode: skipping preload (using gen_buffer_mri + per-step LMDB maps)")
+    elif is_fwi:
+        images = measurements = None
+        logger.log("FWI mode: skipping preload (using online FWI buffer)")
+    else:
+        logger.log("Loading train split...")
+        images, measurements = load_subset(train_dataset, train_indices,
+                                           forward_op, device)
+        logger.log(f"  images={images.shape}, measurements={measurements.shape}")
 
-    if n_val > 0:
+    if is_mri_arch:
+        eval_images = eval_measurements = None
+    elif is_fwi:
+        # Precompute val set from LMDB: run Devito once per sample at startup
+        fwi_n_val = cbg.get("fwi_n_val", 16)
+        val_x_list, val_ymig_list = [], []
+        logger.log(f"Precomputing FWI val set from LMDB (target={fwi_n_val} samples)...")
+        t0_val = time.time()
+        for idx in all_indices[:fwi_n_val * 2]:  # try extra in case some are rejected
+            if len(val_x_list) >= fwi_n_val:
+                break
+            sample = train_dataset[int(idx)]
+            x_gt = sample['target']
+            if isinstance(x_gt, np.ndarray):
+                x_gt = torch.from_numpy(x_gt.copy())
+            x_gt = x_gt.float()
+            if x_gt.ndim == 2:
+                x_gt = x_gt.unsqueeze(0)
+            x_gt = x_gt.unsqueeze(0).to(device)  # [1, C, H, W]
+            if x_gt.abs().max().item() > 1.8:
+                continue
+            shots = forward_op({'target': x_gt})
+            x_zero = torch.zeros_like(x_gt)
+            y_mig, _ = forward_op.gradient(x_zero, shots, return_loss=True, unnormalize=True)
+            val_x_list.append(x_gt.squeeze(0).cpu())
+            val_ymig_list.append(y_mig.squeeze(0).cpu())
+        eval_images = torch.stack(val_x_list).to(device)
+        eval_measurements = torch.stack(val_ymig_list).to(device)
+        n_val = len(eval_images)
+        logger.log(f"  FWI val set: {n_val} samples in {time.time()-t0_val:.1f}s "
+                   f"(eval_images={eval_images.shape})")
+    elif n_val > 0:
         logger.log("Loading eval split...")
         eval_images, eval_measurements = load_subset(
             train_dataset, eval_indices, forward_op, device)
@@ -550,35 +811,68 @@ def main(config: DictConfig):
         eval_images = eval_measurements = None
 
     # --- 3. Infer operator output shape ---
-    y_sample = measurements[:1]
-    is_image_obs = (y_sample.ndim == 4 and not y_sample.is_complex())
-    if is_image_obs:
-        # Image-like observations: directly use channels and spatial dims
+    if is_mri_arch:
+        # MRI surrogate output shape is same as image (MVUE prediction)
+        is_image_obs = True
         obs_shape = None
-        y_channels = y_sample.shape[1]
-        out_channels = y_sample.shape[1]
-        out_size = (y_sample.shape[2], y_sample.shape[3])
-        logger.log(f"Operator output (image): channels={out_channels}, "
-                   f"size={out_size}")
-    else:
-        # Non-image observations (e.g. complex scattering data):
-        # use MeasurementEncoder to project to spatial features
-        obs_shape = tuple(y_sample.shape[1:])
-        y_channels = cbg.get("y_channels", 4)
-        out_channels = y_channels
+        meas_flat_dim = None
+        y_channels = net.img_channels
+        out_channels = net.img_channels
         out_size = (net.img_resolution, net.img_resolution)
-        # Compute flat measurement dim for decoder (complex -> view_as_real doubles)
-        if y_sample.is_complex():
-            meas_flat_dim = y_sample[0].numel() * 2
+        y_sample = None
+    elif is_fwi:
+        # FWI: gradient predictor, image-shaped migration image obs
+        is_image_obs = True
+        obs_shape = None
+        meas_flat_dim = None
+        y_channels = 1
+        out_channels = net.img_channels
+        out_size = (net.img_resolution, net.img_resolution)
+        y_sample = None
+    else:
+        y_sample = measurements[:1]
+    if not is_mri_arch:
+        is_image_obs = (y_sample.ndim == 4 and not y_sample.is_complex())
+        if is_image_obs:
+            obs_shape = None
+            y_channels = y_sample.shape[1]
+            out_channels = y_sample.shape[1]
+            out_size = (y_sample.shape[2], y_sample.shape[3])
+            meas_flat_dim = None
+            logger.log(f"Operator output (image): channels={out_channels}, size={out_size}")
         else:
-            meas_flat_dim = y_sample[0].numel()
-        logger.log(f"Operator output (non-image): obs_shape={obs_shape}, "
-                   f"complex={y_sample.is_complex()}, meas_flat_dim={meas_flat_dim}")
-        logger.log(f"  Using MeasurementEncoder -> y_channels={y_channels}, "
-                   f"out_size={out_size}")
+            obs_shape = tuple(y_sample.shape[1:])
+            y_channels = cbg.get("y_channels", 4)
+            out_channels = y_channels
+            out_size = (net.img_resolution, net.img_resolution)
+            if y_sample.is_complex():
+                meas_flat_dim = y_sample[0].numel() * 2
+            else:
+                meas_flat_dim = y_sample[0].numel()
+            logger.log(f"Operator output (non-image): obs_shape={obs_shape}, "
+                       f"complex={y_sample.is_complex()}, meas_flat_dim={meas_flat_dim}")
+            logger.log(f"  Using MeasurementEncoder -> y_channels={y_channels}, "
+                       f"out_size={out_size}")
 
     # --- 4. Build classifier ---
-    if arch == "unet_surrogate":
+    if arch == "mri_unet_surrogate":
+        classifier = MRIUNetSurrogate(
+            img_resolution=net.img_resolution,
+            img_channels=net.img_channels,
+            num_coils=mri_num_coils,
+            map_channels=mri_map_ch,
+            base_channels=base_channels,
+            channel_mult=channel_mult,
+            attn_heads=attn_heads,
+            num_res_blocks=num_res_blocks,
+            dropout=t_dropout,
+        ).to(device)
+        num_params = sum(p.numel() for p in classifier.parameters())
+        logger.log(f"MRIUNetSurrogate: {num_params/1e6:.2f}M parameters")
+        logger.log(f"  UNet: ch={base_channels}, mult={channel_mult}, "
+                   f"res_blocks={num_res_blocks}, dropout={t_dropout}")
+        logger.log(f"  MRI: num_coils={mri_num_coils}, map_channels={mri_map_ch}")
+    elif arch == "unet_surrogate":
         assert not is_image_obs, "UNetSurrogate requires non-image observations"
         classifier = UNetSurrogate(
             img_resolution=net.img_resolution,
@@ -594,6 +888,25 @@ def main(config: DictConfig):
         ).to(device)
         num_params = sum(p.numel() for p in classifier.parameters())
         logger.log(f"UNetSurrogate: {num_params/1e6:.2f}M parameters")
+        logger.log(f"  UNet: ch={base_channels}, mult={channel_mult}, "
+                   f"res_blocks={num_res_blocks}, dropout={t_dropout}")
+    elif arch == "fwi_surrogate":
+        # UNetSurrogate predicts migration(x) — same pattern as scatter UNetSurrogate
+        classifier = UNetSurrogate(
+            img_resolution=net.img_resolution,
+            img_channels=net.img_channels,
+            obs_shape=obs_shape,
+            meas_flat_dim=meas_flat_dim,
+            base_channels=base_channels,
+            channel_mult=channel_mult,
+            num_res_blocks=num_res_blocks,
+            attn_heads=attn_heads,
+            dropout=t_dropout,
+            mlp_ratio=fno_mlp_ratio,
+        ).to(device)
+        num_params = sum(p.numel() for p in classifier.parameters())
+        logger.log(f"FWI UNetSurrogate (predicts migration image): "
+                   f"{num_params/1e6:.2f}M parameters")
         logger.log(f"  UNet: ch={base_channels}, mult={channel_mult}, "
                    f"res_blocks={num_res_blocks}, dropout={t_dropout}")
     elif arch == "grad_predictor":
@@ -732,7 +1045,12 @@ def main(config: DictConfig):
     #   num_passes controls how many times each sample is seen (each
     #   time with fresh random sigmas and noise).
     # =================================================================
-    total_steps = n_train * num_passes
+    # MRI uses max_steps directly since n_train=0 (pure gen-buffer mode)
+    max_steps = cbg.get("max_steps", 0)
+    if is_mri_arch or is_fwi:
+        total_steps = max_steps if max_steps > 0 else gen_buffer_size * num_passes
+    else:
+        total_steps = n_train * num_passes
 
     # Step-based LR warmup + cosine decay
     warmup_lr_steps = max(int(total_steps * 0.05), 1)
@@ -763,8 +1081,30 @@ def main(config: DictConfig):
     running_rel = 0.0
     running_count = 0
 
+    # FWI: online buffer + optional precomputed val
+    fwi_buffer = None
+    fwi_val_ds = None
+    if is_fwi:
+        fwi_buffer = FWIDiffusionPriorBuffer(
+            net=net, forward_op=forward_op, device=device,
+            buffer_size=gen_buffer_size,
+            gen_batch_size=gen_batch_size,
+            num_steps=gen_steps,
+        )
+        logger.log(f"FWI online buffer: buffer_size={gen_buffer_size}, "
+                   f"steps={gen_steps}, batch={gen_batch_size}")
+        if fwi_val_precomputed_dir is not None:
+            fwi_val_ds = sorted(Path(fwi_val_precomputed_dir).glob("*.npz"))
+            logger.log(f"FWI val dataset: {len(fwi_val_ds)} precomputed triples")
+        if total_steps == 0:
+            total_steps = gen_buffer_size * num_passes
+
     # Build sample indices: each sample repeated num_passes times, all shuffled
-    all_indices = list(range(n_train)) * num_passes
+    # For MRI/FWI (gen-buffer/precomputed only), use dummy indices of the correct length
+    if is_mri_arch or is_fwi:
+        all_indices = list(range(total_steps))
+    else:
+        all_indices = list(range(n_train)) * num_passes
     np.random.shuffle(all_indices)
 
     # Fast-forward LR scheduler if resuming
@@ -778,6 +1118,7 @@ def main(config: DictConfig):
     classifier.train()
     t_pass = time.time()
     is_grad_pred = isinstance(classifier, GradientPredictor)
+    is_mri = isinstance(classifier, MRIUNetSurrogate)
 
     pbar = tqdm.tqdm(all_indices, desc="Training")
 
@@ -786,10 +1127,99 @@ def main(config: DictConfig):
                 if global_step < resume_step:
                     global_step += 1
                     continue
-                # Data source: generated buffer vs LMDB
-                use_generated = (gen_buffer is not None and
-                                 torch.rand(1).item() < gen_mix_ratio)
-                if use_generated:
+
+                # ---- MRI training branch ----
+                if is_mri:
+                    x0, map_idx = gen_buffer_mri.sample(logger)
+                    # Load random maps from LMDB
+                    sample_data = train_dataset[map_idx]
+                    maps_np = sample_data['maps']   # [nc, H, W] complex numpy
+                    maps = torch.from_numpy(
+                        np.array(maps_np, copy=True)).to(device)
+                    maps_1 = maps.unsqueeze(0)      # [1, nc, H, W]
+
+                    # Compute target MVUE(A(x0, maps)) — x0 is already clean,
+                    # no need to add noise and re-denoise
+                    with torch.no_grad():
+                        forward_op.maps = maps_1
+                        y_hat = forward_op.forward(x0)          # [1, nc, H, W, 2]
+                        target = mri_compute_mvue(y_hat, maps_1, None)  # [1, 2, H, W]
+
+                    pred = classifier(x0, None, maps_1)
+                    forward_loss = (pred - target).pow(2).mean()
+
+                    # --- Jacobian cosine matching (finite difference) ---
+                    jac_match_loss = torch.tensor(0.0, device=device)
+                    jac_cos_val = 0.0
+                    if jac_loss:
+                        jac_eps = 1e-3
+                        n_jac_dirs = 2
+                        jac_cos_accum = 0.0
+                        jac_loss_accum = torch.tensor(0.0, device=device)
+                        for _jd in range(n_jac_dirs):
+                            delta = torch.randn_like(x0)
+                            delta = delta / delta.norm().clamp(min=1e-8) * jac_eps
+                            # True Jacobian: finite diff of MVUE(A(x ± delta, maps))
+                            with torch.no_grad():
+                                forward_op.maps = maps_1
+                                yp = forward_op.forward(x0 + delta)
+                                ym = forward_op.forward(x0 - delta)
+                                dA = (mri_compute_mvue(yp, maps_1, None) -
+                                      mri_compute_mvue(ym, maps_1, None)) / (2 * jac_eps)
+                            # Surrogate Jacobian (differentiable)
+                            df = (classifier(x0 + delta, None, maps_1) -
+                                  classifier(x0 - delta, None, maps_1)) / (2 * jac_eps)
+                            cos_jd = F.cosine_similarity(
+                                df.flatten(1), dA.flatten(1), dim=-1)  # [1]
+                            jac_loss_accum = jac_loss_accum + (1.0 - cos_jd).mean()
+                            jac_cos_accum += cos_jd.mean().item()
+                        jac_match_loss = jac_loss_accum / n_jac_dirs
+                        jac_cos_val = jac_cos_accum / n_jac_dirs
+
+                    loss = forward_loss + jac_lambda * jac_match_loss
+
+                    optimizer.zero_grad()
+                    loss.backward()
+                    if grad_clip > 0:
+                        gn = torch.nn.utils.clip_grad_norm_(
+                            classifier.parameters(), grad_clip).item()
+                    else:
+                        gn = 0.0
+                    optimizer.step()
+                    lr_scheduler.step()
+
+                    loss_val = loss.item()
+                    step_losses.append(loss_val)
+                    grad_norms.append(gn)
+                    running_loss += loss_val
+                    running_count += 1
+                    global_step += 1
+
+                    if global_step % log_interval == 0:
+                        avg = running_loss / max(running_count, 1)
+                        cur_lr = optimizer.param_groups[0]['lr']
+                        jac_str = f" jac_cos={jac_cos_val:.3f}" if jac_loss else ""
+                        pbar.set_postfix(loss=f"{avg:.4f}", lr=f"{cur_lr:.2e}")
+                        logger.log(f"  step={global_step}/{total_steps} "
+                                   f"loss={avg:.5f} lr={cur_lr:.2e}{jac_str}")
+                        running_loss = running_count = 0
+                        logger.update_progress(step=global_step, train_loss=avg)
+
+                    if (save_every_steps > 0 and
+                            global_step % save_every_steps == 0):
+                        ckpt_path = root / f"classifier_step{global_step}.pt"
+                        save_classifier(classifier, str(ckpt_path),
+                                        metadata={'step': global_step})
+                        logger.log(f"  Saved checkpoint: {ckpt_path}")
+
+                    if global_step >= total_steps:
+                        break
+                    continue
+
+                # Data source: FWI online buffer / gen buffer / LMDB
+                if is_fwi:
+                    x0, y_single = fwi_buffer.sample(logger)
+                elif gen_buffer is not None and torch.rand(1).item() < gen_mix_ratio:
                     x0, y_single = gen_buffer.sample(logger)
                 else:
                     x0 = images[i:i+1]
@@ -833,7 +1263,11 @@ def main(config: DictConfig):
 
                 else:
                     with torch.no_grad():
-                        if target_mode == "tweedie":
+                        if is_fwi:
+                            # FWI: surrogate predicts migration(x), target is stored y_mig
+                            denoised = net(x_noisy, sigma)
+                            y_hat = y_rep  # y_single is y_mig from buffer
+                        elif target_mode == "tweedie":
                             denoised = net(x_noisy, sigma)
                             y_hat = forward_op({'target': denoised})
                         elif target_mode == "forward":
@@ -843,8 +1277,8 @@ def main(config: DictConfig):
                             denoised = None
                             y_hat = forward_op({'target': x_noisy})
                         # Target: residual (tweedie/direct) or forward prediction
-                        if target_mode == "forward":
-                            raw_target = y_hat  # predict A(denoised) directly
+                        if target_mode == "forward" or is_fwi:
+                            raw_target = y_hat  # predict A(denoised) / migration(x) directly
                         else:
                             raw_target = y_hat - y_rep  # predict residual
                         # Flatten to measurement space
@@ -868,8 +1302,8 @@ def main(config: DictConfig):
                             target = target / tnorm
 
                     pred = classifier(x_noisy, sigma,
-                                      None if target_mode == "forward" else y_rep,
-                                      denoised=denoised if (use_tweedie_input or target_mode == "forward") else None)
+                                      None if (target_mode == "forward" or is_fwi) else y_rep,
+                                      denoised=denoised if (use_tweedie_input or target_mode == "forward" or is_fwi) else None)
                 if is_grad_pred:
                     pass  # per_sample_loss already set above
                 elif t_scalar_output:
@@ -1032,7 +1466,10 @@ def main(config: DictConfig):
                                 sv_bc = sv.view(-1, 1, 1, 1)
                                 epsv = torch.randn_like(x0v)
                                 x_nv = x0v + sv_bc * epsv
-                                if target_mode in ("tweedie", "forward"):
+                                if is_fwi:
+                                    dv = net(x_nv, sv)
+                                    raw_tv = y_bv  # precomputed y_mig, no Devito at val time
+                                elif target_mode in ("tweedie", "forward"):
                                     dv = net(x_nv, sv)
                                     # forward_op may not batch — apply per-sample
                                     y_hv = torch.cat([forward_op({'target': dv[j:j+1]})
@@ -1041,7 +1478,9 @@ def main(config: DictConfig):
                                     dv = None
                                     y_hv = torch.cat([forward_op({'target': x_nv[j:j+1]})
                                                       for j in range(Bv)])
-                                if target_mode == "forward":
+                                if is_fwi:
+                                    pass  # raw_tv already set above
+                                elif target_mode == "forward":
                                     raw_tv = y_hv
                                 else:
                                     raw_tv = y_hv - y_bv
@@ -1063,8 +1502,8 @@ def main(config: DictConfig):
                                     tn = tv.norm(dim=-1, keepdim=True).clamp(min=1e-8)
                                     tv = tv / tn
                                 pv = classifier(x_nv, sv,
-                                                None if target_mode == "forward" else y_bv,
-                                                denoised=dv if (use_tweedie_input or target_mode == "forward") else None)
+                                                None if (target_mode == "forward" or is_fwi) else y_bv,
+                                                denoised=dv if (use_tweedie_input or target_mode == "forward" or is_fwi) else None)
                                 if t_scalar_output:
                                     val_loss += (pv - tv).pow(2).squeeze(-1).mean().item()
                                 elif loss_type == "cosine":

@@ -757,6 +757,157 @@ class UNetSurrogate(nn.Module):
         return self.head(h)       # [B, meas_flat_dim]
 
 
+# ---------------------------------------------------------------------------
+# MRI surrogate
+# ---------------------------------------------------------------------------
+
+class MapsEncoder(nn.Module):
+    """Encodes multi-coil sensitivity maps to a fixed spatial feature map.
+
+    Input:  [B, num_coils, H, W] complex  (or [B, num_coils*2, H, W] real)
+    Output: [B, map_channels, H, W]
+    """
+
+    def __init__(self, num_coils: int = 15, map_channels: int = 4):
+        super().__init__()
+        self.num_coils = num_coils
+        self.map_channels = map_channels
+        in_ch = num_coils * 2
+        mid = max(map_channels * 4, 16)
+        self.encoder = nn.Sequential(
+            nn.Conv2d(in_ch, mid, 3, padding=1),
+            nn.GroupNorm(min(32, mid), mid),
+            nn.GELU(),
+            nn.Conv2d(mid, map_channels * 2, 3, padding=1),
+            nn.GroupNorm(min(32, map_channels * 2), map_channels * 2),
+            nn.GELU(),
+            nn.Conv2d(map_channels * 2, map_channels, 1),
+        )
+
+    def forward(self, maps: torch.Tensor) -> torch.Tensor:
+        if maps.is_complex():
+            B, nc, H, W = maps.shape
+            r = torch.view_as_real(maps)               # [B, nc, H, W, 2]
+            maps = r.permute(0, 1, 4, 2, 3).reshape(B, nc * 2, H, W)
+        return self.encoder(maps.float())
+
+
+class MRIUNetSurrogate(nn.Module):
+    """MRI surrogate: (denoised, maps) → MVUE(A(denoised, maps)).
+
+    Predicts the coil-combined reconstruction A†A(x) in image space
+    [B, img_channels, H, W], conditioned on sensitivity maps via MapsEncoder.
+
+    No sigma conditioning — the MVUE target is sigma-independent.
+
+    Training target:  compute MVUE(forward_op.forward(denoised)) analytically
+                      (cheap FFT operations, no diffusion backprop needed).
+
+    Guidance at inference:
+        loss = ||f_θ(denoised, maps) - MVUE(y_obs, maps)||²
+        gradient flows only through this small network, not the diffusion model.
+    """
+
+    def __init__(self, img_resolution: int = 320, img_channels: int = 2,
+                 num_coils: int = 15, map_channels: int = 4,
+                 base_channels: int = 64, channel_mult=(1, 2, 4, 4),
+                 attn_heads: int = 4, num_res_blocks: int = 1,
+                 dropout: float = 0.0):
+        super().__init__()
+        self.img_resolution = img_resolution
+        self.img_channels = img_channels
+        self.num_coils = num_coils
+        self.map_channels = map_channels
+        self.base_channels = base_channels
+        self.channel_mult = list(channel_mult)
+        self.attn_heads = attn_heads
+        self.num_res_blocks = num_res_blocks
+        self.dropout_rate = dropout
+
+        C = base_channels
+        ch_list = [C * m for m in channel_mult]
+        bot_ch = ch_list[-1]
+
+        self.maps_encoder = MapsEncoder(num_coils, map_channels)
+
+        # Input: cat(denoised, maps_enc) = [img_channels + map_channels, H, W]
+        self.input_conv = nn.Conv2d(img_channels + map_channels, C, 3, padding=1)
+
+        # Encoder
+        self.enc_blocks = nn.ModuleList()
+        self.downsamples = nn.ModuleList()
+        prev_ch = C
+        for cur_ch in ch_list:
+            level_blocks = nn.ModuleList()
+            for j in range(num_res_blocks):
+                level_blocks.append(UNetResBlock(
+                    prev_ch if j == 0 else cur_ch, cur_ch, dropout))
+            self.enc_blocks.append(level_blocks)
+            self.downsamples.append(nn.Conv2d(cur_ch, cur_ch, 3, stride=2, padding=1))
+            prev_ch = cur_ch
+
+        # Bottleneck
+        self.mid_block1 = UNetResBlock(bot_ch, bot_ch, dropout)
+        self.mid_attn = SelfAttention(bot_ch, attn_heads)
+        self.mid_block2 = UNetResBlock(bot_ch, bot_ch, dropout)
+
+        # Decoder
+        self.upsample_layers = nn.ModuleList()
+        self.dec_blocks = nn.ModuleList()
+        dec_prev_ch = bot_ch
+        for i in reversed(range(len(channel_mult))):
+            skip_ch = ch_list[i]
+            dec_out_ch = ch_list[i - 1] if i > 0 else C
+            self.upsample_layers.append(nn.Upsample(scale_factor=2, mode='nearest'))
+            level_blocks = nn.ModuleList()
+            for j in range(num_res_blocks):
+                in_ch = (dec_prev_ch + skip_ch) if j == 0 else dec_out_ch
+                level_blocks.append(UNetResBlock(in_ch, dec_out_ch, dropout))
+            self.dec_blocks.append(level_blocks)
+            dec_prev_ch = dec_out_ch
+
+        self.out_norm = nn.GroupNorm(min(32, C), C)
+        self.out_conv = zero_module(nn.Conv2d(C, img_channels, 1))
+
+    def forward(self, x_t, sigma, maps, denoised=None):
+        """
+        Args:
+            x_t:      [B, img_channels, H, W] (used only if denoised is None)
+            sigma:    ignored (no sigma conditioning)
+            maps:     [B, num_coils, H, W] complex sensitivity maps
+            denoised: [B, img_channels, H, W] Tweedie estimate (preferred)
+        Returns:
+            [B, img_channels, H, W] predicted MVUE of A(denoised, maps)
+        """
+        img = denoised if denoised is not None else x_t
+
+        maps_enc = self.maps_encoder(maps)  # [B, map_channels, H, W]
+        h = self.input_conv(torch.cat([img, maps_enc], dim=1))
+
+        # Encoder
+        skips = []
+        for level_blocks, down in zip(self.enc_blocks, self.downsamples):
+            for blk in level_blocks:
+                h = blk(h)
+            skips.append(h)
+            h = down(h)
+
+        # Bottleneck
+        h = self.mid_block1(h)
+        h = self.mid_attn(h)
+        h = self.mid_block2(h)
+
+        # Decoder
+        for up, level_blocks in zip(self.upsample_layers, self.dec_blocks):
+            h = up(h)
+            h = torch.cat([h, skips.pop()], dim=1)
+            for blk in level_blocks:
+                h = blk(h)
+
+        h = F.silu(self.out_norm(h))
+        return self.out_conv(h)
+
+
 class GradientPredictor(nn.Module):
     """Image-to-image UNet that directly predicts the guidance gradient.
 
@@ -901,6 +1052,119 @@ class GradientPredictor(nn.Module):
         # Output
         h = F.silu(self.out_norm(h))
         return self.out_conv(h)
+
+
+class FWIGradientPredictor(nn.Module):
+    """Gradient predictor for FWI with image-shaped migration image as observation.
+
+    Like GradientPredictor but y is already a [B, 1, H, W] migration image
+    (physics-based back-projection of seismic data), so no MeasurementEncoder
+    is needed — y is concatenated directly with x0.
+
+    Input:  cat(x0 [B,1,H,W], y_mig [B,1,H,W]) → [B, 2, H, W]
+    Output: gradient [B, 1, H, W]
+    Sigma conditioning via FiLM (gradient magnitude depends on noise level).
+    """
+
+    def __init__(self, img_resolution=128, img_channels=1,
+                 base_channels=64, channel_mult=(1, 2, 4, 4),
+                 emb_dim=256, attn_heads=4,
+                 num_res_blocks=2, dropout=0.0):
+        super().__init__()
+        self.img_resolution = img_resolution
+        self.img_channels = img_channels
+        self.base_channels = base_channels
+        self.channel_mult = list(channel_mult)
+        self.emb_dim = emb_dim
+        self.attn_heads = attn_heads
+        self.num_res_blocks = num_res_blocks
+        self.dropout_rate = dropout
+
+        C = base_channels
+        ch_list = [C * m for m in channel_mult]
+        bot_ch = ch_list[-1]
+
+        self.sigma_mlp = nn.Sequential(
+            nn.Linear(emb_dim, emb_dim),
+            nn.SiLU(),
+            nn.Linear(emb_dim, emb_dim),
+        )
+        # Input: x0 (img_channels) + y_mig (1 channel)
+        self.input_conv = nn.Conv2d(img_channels + 1, C, 3, padding=1)
+
+        self.enc_blocks = nn.ModuleList()
+        self.downsamples = nn.ModuleList()
+        prev_ch = C
+        for cur_ch in ch_list:
+            level_blocks = nn.ModuleList()
+            for j in range(num_res_blocks):
+                level_blocks.append(ResBlock(
+                    prev_ch if j == 0 else cur_ch, cur_ch, emb_dim))
+            self.enc_blocks.append(level_blocks)
+            self.downsamples.append(nn.Conv2d(cur_ch, cur_ch, 3, stride=2, padding=1))
+            prev_ch = cur_ch
+
+        self.bot_res1 = ResBlock(bot_ch, bot_ch, emb_dim)
+        self.bot_attn = SelfAttention(bot_ch, num_heads=attn_heads)
+        self.bot_res2 = ResBlock(bot_ch, bot_ch, emb_dim)
+
+        self.upsample_layers = nn.ModuleList()
+        self.dec_blocks = nn.ModuleList()
+        dec_prev_ch = bot_ch
+        for i in reversed(range(len(channel_mult))):
+            skip_ch = ch_list[i]
+            dec_out_ch = ch_list[i - 1] if i > 0 else C
+            self.upsample_layers.append(nn.Upsample(scale_factor=2, mode='nearest'))
+            level_blocks = nn.ModuleList()
+            for j in range(num_res_blocks):
+                in_ch = (dec_prev_ch + skip_ch) if j == 0 else dec_out_ch
+                level_blocks.append(ResBlock(in_ch, dec_out_ch, emb_dim))
+            self.dec_blocks.append(level_blocks)
+            dec_prev_ch = dec_out_ch
+
+        self.out_norm = nn.GroupNorm(min(32, C), C)
+        self.out_conv = zero_module(nn.Conv2d(C, img_channels, 1))
+
+    def forward(self, x_t, sigma, y_mig, denoised=None):
+        """
+        Args:
+            x_t:    [B, 1, H, W] noisy velocity model
+            sigma:  [B] or scalar noise level
+            y_mig:  [B, 1, H, W] migration image (compressed seismic observation)
+        Returns:
+            [B, 1, H, W] predicted gradient
+        """
+        B = x_t.shape[0]
+        if not isinstance(sigma, torch.Tensor):
+            sigma_t = torch.tensor([sigma], dtype=torch.float32,
+                                   device=x_t.device).expand(B)
+        else:
+            sigma_t = sigma.float().view(-1)
+            if sigma_t.numel() == 1:
+                sigma_t = sigma_t.expand(B)
+        emb = timestep_embedding(sigma_t.log(), self.emb_dim)
+        emb = self.sigma_mlp(emb)
+
+        h = self.input_conv(torch.cat([x_t, y_mig], dim=1))
+
+        skips = []
+        for level_blocks, down in zip(self.enc_blocks, self.downsamples):
+            for blk in level_blocks:
+                h = blk(h, emb)
+            skips.append(h)
+            h = down(h)
+
+        h = self.bot_res1(h, emb)
+        h = self.bot_attn(h)
+        h = self.bot_res2(h, emb)
+
+        for up, level_blocks in zip(self.upsample_layers, self.dec_blocks):
+            h = up(h)
+            h = torch.cat([h, skips.pop()], dim=1)
+            for blk in level_blocks:
+                h = blk(h, emb)
+
+        return self.out_conv(F.silu(self.out_norm(h)))
 
 
 # ---------------------------------------------------------------------------
@@ -1486,6 +1750,41 @@ def save_classifier(classifier, path, metadata=None):
     Dispatches on architecture type: 'surrogate' (ForwardSurrogate),
     'transformer' (TransformerCBG), or 'unet' (MeasurementPredictor).
     """
+    if isinstance(classifier, MRIUNetSurrogate):
+        config = {
+            'arch': 'mri_unet_surrogate',
+            'img_resolution': classifier.img_resolution,
+            'img_channels': classifier.img_channels,
+            'num_coils': classifier.num_coils,
+            'map_channels': classifier.map_channels,
+            'base_channels': classifier.base_channels,
+            'channel_mult': list(classifier.channel_mult),
+            'attn_heads': classifier.attn_heads,
+            'num_res_blocks': classifier.num_res_blocks,
+            'dropout': classifier.dropout_rate,
+        }
+        checkpoint = {'state_dict': classifier.state_dict(), 'config': config}
+        if metadata:
+            checkpoint.update(metadata)
+        torch.save(checkpoint, path)
+        return
+    if isinstance(classifier, FWIGradientPredictor):
+        config = {
+            'arch': 'fwi_grad_predictor',
+            'img_resolution': classifier.img_resolution,
+            'img_channels': classifier.img_channels,
+            'base_channels': classifier.base_channels,
+            'channel_mult': list(classifier.channel_mult),
+            'emb_dim': classifier.emb_dim,
+            'attn_heads': classifier.attn_heads,
+            'num_res_blocks': classifier.num_res_blocks,
+            'dropout': classifier.dropout_rate,
+        }
+        checkpoint = {'state_dict': classifier.state_dict(), 'config': config}
+        if metadata:
+            checkpoint.update(metadata)
+        torch.save(checkpoint, path)
+        return
     if isinstance(classifier, GradientPredictor):
         config = {
             'arch': 'grad_predictor',
@@ -1642,6 +1941,22 @@ def load_classifier(path, device='cuda'):
     config = dict(checkpoint['config'])
 
     arch = config.pop('arch', 'unet')
+
+    if arch == 'mri_unet_surrogate':
+        if 'channel_mult' in config:
+            config['channel_mult'] = tuple(config['channel_mult'])
+        classifier = MRIUNetSurrogate(**config).to(device)
+        classifier.load_state_dict(checkpoint['state_dict'])
+        classifier.eval()
+        return classifier
+
+    if arch == 'fwi_grad_predictor':
+        if 'channel_mult' in config:
+            config['channel_mult'] = tuple(config['channel_mult'])
+        classifier = FWIGradientPredictor(**config).to(device)
+        classifier.load_state_dict(checkpoint['state_dict'])
+        classifier.eval()
+        return classifier
 
     if arch == 'grad_predictor':
         if 'obs_shape' in config:
