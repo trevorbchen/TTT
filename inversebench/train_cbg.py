@@ -39,7 +39,7 @@ from hydra.utils import instantiate
 
 import sys
 # classifier.py lives in the repo root (same dir as this script when deployed)
-_repo_root = str(Path(__file__).resolve().parent)
+_repo_root = str(Path(__file__).resolve().parent.parent)
 if _repo_root not in sys.path:
     sys.path.insert(0, _repo_root)
 
