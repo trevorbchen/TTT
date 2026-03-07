@@ -1,0 +1,15 @@
+name: DiffPIR
+method:
+  _target_: algo.diffpir.DiffPIR
+  diffusion_scheduler_config:
+    num_steps: 1000
+    schedule: 'vp'
+    timestep: 'vp'
+    scaling: 'vp'
+    # schedule: 'linear'
+    # timestep: 'poly-7'
+  sigma_n: 0.05
+  lamb: 8.0 # regularization parameter
+  xi: 1 # stochasticity
+  linear: False # True for Inverse Scattering
+

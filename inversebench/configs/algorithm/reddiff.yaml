@@ -1,0 +1,15 @@
+name: REDDiff
+method:
+  _target_: algo.reddiff.REDDiff
+  num_steps: 1000
+  # images
+  observation_weight: 1.0
+  base_lr: 2e-2
+  base_lambda: 0.25
+  lambda_scheduling_type: 'constant'
+
+  # blackhole
+#  observation_weight: 1e-4
+#  base_lr: 1e-2
+#  base_lambda: 0.25
+#  lambda_scheduling_type: 'constant'
