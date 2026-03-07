@@ -15,7 +15,7 @@ from hydra.utils import instantiate
 from pathlib import Path
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from classifier import load_classifier
 from utils.helper import open_url
 from utils.scheduler import Scheduler

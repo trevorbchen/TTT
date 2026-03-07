@@ -51,35 +51,70 @@ def plain_sample(net, scheduler, device):
 
 
 def cbg_sample(net, classifier, forward_op, obs, scheduler,
-               guidance_scale=1.0, device='cuda'):
-    """CBG reconstruction — gradient only through small classifier."""
+               guidance_scale=1.0, device='cuda', target_mode='tweedie'):
+    """CBG reconstruction — classifier as differentiable surrogate for A.
+
+    For forward mode: gradient flows through diffusion model → classifier
+    (like DPS, but classifier replaces A).
+    """
+    # Precompute flat y for forward-mode guidance
+    if target_mode == "forward":
+        if obs.is_complex():
+            y_flat = torch.view_as_real(obs).flatten(1).float()
+        else:
+            y_flat = obs.flatten(1).float()
+
     x = torch.randn(
         1, net.img_channels, net.img_resolution, net.img_resolution,
         device=device
     ) * scheduler.sigma_max
 
-    with torch.no_grad():
-        for i in range(scheduler.num_steps):
-            sigma = scheduler.sigma_steps[i]
-            scaling = scheduler.scaling_steps[i]
-            factor = scheduler.factor_steps[i]
-            scaling_factor = scheduler.scaling_factor[i]
+    for i in range(scheduler.num_steps):
+        sigma = scheduler.sigma_steps[i]
+        scaling = scheduler.scaling_steps[i]
+        factor = scheduler.factor_steps[i]
+        scaling_factor = scheduler.scaling_factor[i]
+        sigma_t = torch.as_tensor(sigma).to(device)
 
-            denoised = net(x / scaling, torch.as_tensor(sigma).to(device))
+        if target_mode == "forward":
+            # Gradient through diffusion model → classifier
+            x_in = x.detach().requires_grad_(True)
+            net.requires_grad_(True)
+            denoised = net(x_in / scaling, sigma_t)
+
+            pred = classifier(
+                x_in / scaling, sigma_t, None,
+                denoised=denoised)
+            loss_val = (pred.flatten(1) - y_flat).pow(2).sum(-1)
+            grad_x = torch.autograd.grad(loss_val.sum(), x_in)[0]
+
+            net.requires_grad_(False)
+            with torch.no_grad():
+                denoised_clean = net(x / scaling, sigma_t)
+        else:
+            # Legacy: grad only through classifier
+            with torch.no_grad():
+                denoised = net(x / scaling, sigma_t)
 
             with torch.enable_grad():
                 x_in = x.detach().requires_grad_(True)
                 pred = classifier(
-                    x_in / scaling,
-                    torch.as_tensor(sigma).to(device), obs)
-                loss_val = pred.pow(2).flatten(1).sum(-1)
+                    x_in / scaling, sigma_t, obs,
+                    denoised=denoised)
+                if getattr(classifier, 'scalar_output', False):
+                    loss_val = pred.squeeze(-1)
+                else:
+                    loss_val = pred.pow(2).flatten(1).sum(-1)
                 grad_x = torch.autograd.grad(loss_val.sum(), x_in)[0]
 
+            denoised_clean = denoised
+
+        with torch.no_grad():
             norm_factor = loss_val.sqrt().view(-1, *([1] * (grad_x.ndim - 1)))
             norm_factor = norm_factor.clamp(min=1e-8)
             normalized_grad = grad_x / norm_factor
 
-            score = (denoised - x / scaling) / sigma ** 2 / scaling
+            score = (denoised_clean - x / scaling) / sigma ** 2 / scaling
             x = x * scaling_factor + factor * score * 0.5
             x = x - guidance_scale * normalized_grad
 
@@ -177,6 +212,12 @@ def main(config: DictConfig):
     classifier = load_classifier(classifier_path, device=device)
     classifier.eval()
 
+    # Load target_mode from checkpoint metadata
+    ckpt_meta = torch.load(classifier_path, map_location='cpu', weights_only=False)
+    target_mode = ckpt_meta.get("target_mode", "tweedie")
+    print(f"  Target mode: {target_mode}")
+    del ckpt_meta
+
     scheduler = Scheduler(num_steps=num_steps, schedule="vp",
                           timestep="vp", scaling="vp")
 
@@ -211,7 +252,8 @@ def main(config: DictConfig):
         # CBG
         torch.manual_seed(42 + i)
         recon = cbg_sample(net, classifier, forward_op, y_i, scheduler,
-                           guidance_scale=guidance_scale, device=device)
+                           guidance_scale=guidance_scale, device=device,
+                           target_mode=target_mode)
         cbg_recons.append(recon.cpu())
         cbg_losses.append(forward_op.loss(recon, y_i).item())
 

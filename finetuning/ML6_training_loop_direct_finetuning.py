@@ -24,6 +24,7 @@ import sys
 import matplotlib.pyplot as plt
 import itertools
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from copy import deepcopy
 from omegaconf import OmegaConf, DictConfig
 

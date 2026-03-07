@@ -26,7 +26,9 @@ import torch
 import numpy as np
 import tqdm
 import hydra
+import sys
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from omegaconf import OmegaConf, DictConfig
 from torchvision.utils import save_image
 

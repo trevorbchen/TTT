@@ -25,7 +25,9 @@ import torch.nn.functional as F
 import numpy as np
 import tqdm
 import hydra
+import sys
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from omegaconf import OmegaConf, DictConfig
 
 from forward_operator import get_operator

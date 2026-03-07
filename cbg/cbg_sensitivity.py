@@ -12,7 +12,7 @@ Also supports legacy residual mode (auto-detected from checkpoint).
 import torch, pickle, sys, numpy as np
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from classifier import load_classifier
 from utils.helper import open_url
 

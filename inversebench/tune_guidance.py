@@ -47,14 +47,18 @@ def cbg_sample(net, classifier, forward_op, obs, scheduler,
         factor = scheduler.factor_steps[i]
         scaling_factor = scheduler.scaling_factor[i]
 
-        denoised = net(x / scaling, torch.as_tensor(sigma).to(device))
+        sigma_t = torch.as_tensor(sigma).to(device)
+        denoised = net(x / scaling, sigma_t)
 
         with torch.enable_grad():
             x_in = x.detach().requires_grad_(True)
             pred = classifier(
-                x_in / scaling,
-                torch.as_tensor(sigma).to(device), obs)
-            loss_val = pred.pow(2).flatten(1).sum(-1)
+                x_in / scaling, sigma_t, obs,
+                denoised=denoised)
+            if getattr(classifier, 'scalar_output', False):
+                loss_val = pred.squeeze(-1)  # pred IS the loss
+            else:
+                loss_val = pred.pow(2).flatten(1).sum(-1)
             grad_x = torch.autograd.grad(loss_val.sum(), x_in)[0]
 
         norm_factor = loss_val.sqrt().view(-1, *([1] * (grad_x.ndim - 1)))
