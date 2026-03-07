@@ -120,6 +120,8 @@ db/*.sqlite
 *.ogg
 !README.assets/*.png
 !README.assets/*.jpg
+!eval_images/**/*.png
+!eval_images/*.png
 !README.assets/*.mp4
 !README.assets/*.gif
 !dataset/demo-ffhq/*.png
