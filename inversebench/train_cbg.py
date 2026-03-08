@@ -831,7 +831,7 @@ def main(config: DictConfig):
         y_sample = None
     else:
         y_sample = measurements[:1]
-    if not is_mri_arch:
+    if not is_mri_arch and not is_fwi:
         is_image_obs = (y_sample.ndim == 4 and not y_sample.is_complex())
         if is_image_obs:
             obs_shape = None
