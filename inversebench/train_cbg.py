@@ -1410,7 +1410,7 @@ def main(config: DictConfig):
                                f"grad_norm={grad_test.norm().item():.6f} | "
                                f"grad_abs_mean={grad_test.abs().mean().item():.6f} | "
                                f"grad_max={grad_test.abs().max().item():.6f}")
-                    if grad_test.norm().item() < 1e-8:
+                    if grad_test.abs().max().item() < 1e-6:
                         logger.log("  [FWI Grad Check] WARNING: gradient near zero!")
                     else:
                         logger.log("  [FWI Grad Check] Gradients flowing OK")

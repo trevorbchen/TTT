@@ -704,7 +704,10 @@ class UNetSurrogate(nn.Module):
         self._image_output = (meas_flat_dim is None)
         if self._image_output:
             # Image output: conv 1x1 -> [B, img_channels, H, W]
-            self.out_conv = zero_module(nn.Conv2d(C, img_channels, 1))
+            # Small init (not zero) so gradients flow from step 1
+            self.out_conv = nn.Conv2d(C, img_channels, 1)
+            nn.init.normal_(self.out_conv.weight, std=0.01)
+            nn.init.zeros_(self.out_conv.bias)
         else:
             # Flat vector output: pool -> MLP -> [B, meas_flat_dim]
             pool_size = 8
