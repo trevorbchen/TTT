@@ -92,7 +92,7 @@ class SurrogateOperator:
     def gradient(self, x, y, return_loss=False):
         """nabla_x ||surrogate(x) - y||^2"""
         x_in = x.clone().detach().requires_grad_(True)
-        pred = self.classifier(x_in, None, None, denoised=x_in)
+        pred = self.classifier(x_in)
         y_flat = self._flat_y(y)
         loss_val = (pred.flatten(1) - y_flat).pow(2).sum(-1)
         grad_x = torch.autograd.grad(loss_val.sum(), x_in)[0]

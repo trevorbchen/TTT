@@ -101,9 +101,7 @@ class TTTCBG(Algo):
                 self.net.requires_grad_(True)
                 denoised = self.net(x_in / scaling, sigma_t)
 
-                pred = self.classifier(
-                    x_in / scaling, sigma_t, None,
-                    denoised=denoised)
+                pred = self.classifier(denoised)
                 loss_per_sample = (pred.flatten(1) - y_flat).pow(2).sum(-1)
                 grad_x = torch.autograd.grad(loss_per_sample.sum(), x_in)[0]
 

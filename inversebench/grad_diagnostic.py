@@ -114,8 +114,7 @@ def main(config: DictConfig):
             x_in_cbg = x_cbg.detach().requires_grad_(True)
             net.requires_grad_(True)
             denoised_cbg = net(x_in_cbg / scaling, sigma_t)
-            pred_cbg = classifier(x_in_cbg / scaling, sigma_t, None,
-                                  denoised=denoised_cbg)
+            pred_cbg = classifier(denoised_cbg)
             loss_cbg = (pred_cbg.flatten(1) - y_flat).pow(2).sum(-1)
             grad_cbg = torch.autograd.grad(loss_cbg.sum(), x_in_cbg)[0]
             net.requires_grad_(False)

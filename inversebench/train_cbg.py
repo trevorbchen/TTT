@@ -214,11 +214,10 @@ class FWIDiffusionPriorBuffer:
                        f"({n_rejected} rejected) in {time.time()-t0:.1f}s")
 
     def sample(self, logger=None):
-        """Next (x_gt, y_mig) pair on device. Cycles buffer; refreshes only when empty."""
-        if len(self._buffer) == 0:
+        """Next (x_gt, y_mig) pair on device. Auto-refreshes when exhausted."""
+        if len(self._buffer) == 0 or self._cursor >= len(self._buffer):
             self.refresh(logger)
-        idx = self._cursor % len(self._buffer)
-        x_gt, y_mig = self._buffer[idx]
+        x_gt, y_mig = self._buffer[self._cursor]
         self._cursor += 1
         return x_gt.to(self.device), y_mig.to(self.device)
 
@@ -538,9 +537,12 @@ def evaluate_held_out(classifier, net, forward_op, eval_images,
         if normalize_target:
             tnorm = target.norm(dim=-1, keepdim=True).clamp(min=1e-8)
             target = target / tnorm
-        pred = classifier(x_noisy, sigma,
-                          None if target_mode == "forward" else y_batch,
-                          denoised=denoised if target_mode in ("tweedie", "forward") else None)
+        if isinstance(classifier, (UNetSurrogate, FNOSurrogate, ForwardSurrogate)):
+            pred = classifier(denoised)
+        else:
+            pred = classifier(x_noisy, sigma,
+                              None if target_mode == "forward" else y_batch,
+                              denoised=denoised if target_mode in ("tweedie", "forward") else None)
 
         total_pred_loss += (pred - target).pow(2).flatten(1).sum(-1).mean().item()
         total_target_loss += target.norm().item()
@@ -695,6 +697,7 @@ def main(config: DictConfig):
 
     is_mri_arch = (arch == "mri_unet_surrogate")
     is_fwi = (arch == "fwi_surrogate")
+    is_surrogate = (arch in ("unet_surrogate", "fwi_surrogate", "fno_surrogate", "forward_surrogate"))
 
     # --- 1. Load components ---
     logger.log("Loading forward operator...")
@@ -1303,9 +1306,12 @@ def main(config: DictConfig):
                             tnorm = target.norm(dim=-1, keepdim=True).clamp(min=1e-8)
                             target = target / tnorm
 
-                    pred = classifier(x_noisy, sigma,
-                                      None if (target_mode == "forward" or is_fwi) else y_rep,
-                                      denoised=denoised if (use_tweedie_input or target_mode == "forward" or is_fwi) else None)
+                    if is_surrogate:
+                        pred = classifier(denoised)
+                    else:
+                        pred = classifier(x_noisy, sigma,
+                                          None if target_mode == "forward" else y_rep,
+                                          denoised=denoised if (use_tweedie_input or target_mode == "forward") else None)
                 if is_grad_pred:
                     pass  # per_sample_loss already set above
                 elif t_scalar_output:
@@ -1358,10 +1364,8 @@ def main(config: DictConfig):
                                 dA = (A_plus - A_minus).flatten(1).float() / (2 * jac_eps)
 
                         # Surrogate directional derivative (differentiable)
-                        pred_plus = classifier(x_noisy, sigma, None,
-                                               denoised=denoised_d + delta)
-                        pred_minus = classifier(x_noisy, sigma, None,
-                                                denoised=denoised_d - delta)
+                        pred_plus = classifier(denoised_d + delta)
+                        pred_minus = classifier(denoised_d - delta)
                         df = (pred_plus - pred_minus) / (2 * jac_eps)
 
                         # Cosine similarity between directional derivatives
@@ -1402,7 +1406,7 @@ def main(config: DictConfig):
                     classifier.eval()
                     x_test = x0.detach().clone().requires_grad_(True)
                     with torch.enable_grad():
-                        pred_test = classifier(x_test, sigma[:1], None, denoised=x_test)
+                        pred_test = classifier(x_test)
                         fake_target = torch.zeros_like(pred_test)
                         loss_test = (pred_test - fake_target).pow(2).sum()
                         grad_test = torch.autograd.grad(loss_test, x_test)[0]
@@ -1467,7 +1471,7 @@ def main(config: DictConfig):
                             grad_true_v = torch.autograd.grad(
                                 loss_v.sum(), dv_g, create_graph=False)[0].detach()
                             with torch.no_grad():
-                                pv = classifier(x_nv, sv, y_bv, denoised=dv)
+                                pv = classifier(dv) if is_surrogate else classifier(x_nv, sv, y_bv, denoised=dv)
                                 cos_v = F.cosine_similarity(
                                     pv.flatten(1), grad_true_v.flatten(1), dim=-1)
                                 valid_v = grad_true_v.flatten(1).norm(dim=-1) > 1e-6
@@ -1524,9 +1528,12 @@ def main(config: DictConfig):
                                 elif normalize_target:
                                     tn = tv.norm(dim=-1, keepdim=True).clamp(min=1e-8)
                                     tv = tv / tn
-                                pv = classifier(x_nv, sv,
-                                                None if (target_mode == "forward" or is_fwi) else y_bv,
-                                                denoised=dv if (use_tweedie_input or target_mode == "forward" or is_fwi) else None)
+                                if is_surrogate:
+                                    pv = classifier(dv)
+                                else:
+                                    pv = classifier(x_nv, sv,
+                                                    None if target_mode == "forward" else y_bv,
+                                                    denoised=dv if (use_tweedie_input or target_mode == "forward") else None)
                                 if t_scalar_output:
                                     val_loss += (pv - tv).pow(2).squeeze(-1).mean().item()
                                 elif loss_type == "cosine":
@@ -1566,7 +1573,7 @@ def main(config: DictConfig):
                                     loss_jac.sum(), dv_jac, create_graph=False)[0].detach()
                                 # Surrogate gradient
                                 pv_jac = dv.detach().requires_grad_(True)
-                                pred_jac = classifier(x_nv, sv, None, denoised=pv_jac)
+                                pred_jac = classifier(pv_jac) if is_surrogate else classifier(x_nv, sv, None, denoised=pv_jac)
                                 if pred_jac.is_complex():
                                     pred_flat = torch.view_as_real(pred_jac).flatten(1).float()
                                 else:
@@ -1619,7 +1626,7 @@ def main(config: DictConfig):
                                         tg = torch.view_as_real(y_hg).flatten(1).float()
                                     else:
                                         tg = y_hg.flatten(1).float()
-                                    pg = classifier(x_ng, svg, None, denoised=dg)
+                                    pg = classifier(dg) if is_surrogate else classifier(x_ng, svg, None, denoised=dg)
                                     gen_val_loss += (pg - tg).pow(2).flatten(1).sum(-1).mean().item()
                                     gen_val_batches += 1
                         avg_gen_val = gen_val_loss / max(gen_val_batches, 1)

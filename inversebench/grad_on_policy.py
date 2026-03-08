@@ -127,7 +127,7 @@ def main(config: DictConfig):
             grad_dps = torch.autograd.grad(loss_dps.sum(), x_in, retain_graph=True)[0]
 
             # --- CBG gradient (surrogate) --- same x_in, same denoised
-            pred_cbg = classifier(x_in / scaling, sigma_t, None, denoised=denoised)
+            pred_cbg = classifier(denoised)
             loss_cbg = (pred_cbg.flatten(1) - y_flat).pow(2).sum(-1)
             grad_cbg = torch.autograd.grad(loss_cbg.sum(), x_in)[0]
 

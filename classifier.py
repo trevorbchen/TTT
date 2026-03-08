@@ -626,15 +626,11 @@ class UNetResBlock(nn.Module):
 class UNetSurrogate(nn.Module):
     """UNet-based surrogate for the forward operator A.
 
+    Pure mapping x_0 -> A(x_0).  No noise-level conditioning — the input
+    is always the Tweedie estimate (clean image), so sigma is irrelevant.
+
     Encoder-decoder with skip connections, designed for better inductive bias
     on sparse/structured data compared to ViT (ForwardSurrogate).
-
-    Follows the same encoder/decoder pattern as MeasurementPredictor:
-    every level downsamples (encoder) and upsamples (decoder), with one
-    skip connection per level.
-
-    Interface matches ForwardSurrogate: forward(x_t, sigma, y, denoised=None)
-    uses `denoised` if provided, ignores sigma/y.
     """
 
     def __init__(self, img_resolution=128, img_channels=1,
@@ -724,18 +720,19 @@ class UNetSurrogate(nn.Module):
             nn.init.normal_(self.head[-1].weight, std=0.01)
             nn.init.zeros_(self.head[-1].bias)
 
-    def forward(self, x_t, sigma, y, denoised=None):
-        """
+    def forward(self, x_0, sigma=None, y=None, denoised=None):
+        """Forward operator surrogate: x_0 -> A(x_0).  No noise conditioning.
+
         Args:
-            x_t:      [B, C, H, W] (used only if denoised is None)
-            sigma:    ignored
-            y:        ignored
-            denoised: [B, C, H, W] Tweedie estimate (preferred input)
+            x_0:      [B, C, H, W] clean image (Tweedie estimate)
+            sigma:    unused (interface compat)
+            y:        unused (interface compat)
+            denoised: [B, C, H, W] alias for x_0 (legacy compat)
 
         Returns:
-            [B, meas_flat_dim] predicted A(image)
+            [B, meas_flat_dim] or [B, C, H, W] predicted A(x_0)
         """
-        img = denoised if denoised is not None else x_t
+        img = denoised if denoised is not None else x_0
 
         h = self.input_conv(img)
 

@@ -42,7 +42,8 @@ _repo_root = str(Path(__file__).resolve().parent)
 if _repo_root not in sys.path:
     sys.path.insert(0, _repo_root)
 
-from classifier import load_classifier, GradientPredictor
+from classifier import (load_classifier, GradientPredictor,
+                        UNetSurrogate, FNOSurrogate, ForwardSurrogate)
 from utils.helper import open_url
 from utils.scheduler import Scheduler
 
@@ -120,9 +121,13 @@ def cbg_sample(net, classifier, forward_op, observation, scheduler,
             net.requires_grad_(True)
             denoised = net(x_in / scaling, sigma_t)
 
-            pred = classifier(
-                x_in / scaling, sigma_t, None,
-                denoised=denoised)
+            _is_surr = isinstance(classifier, (UNetSurrogate, FNOSurrogate, ForwardSurrogate))
+            if _is_surr:
+                pred = classifier(denoised)
+            else:
+                pred = classifier(
+                    x_in / scaling, sigma_t, None,
+                    denoised=denoised)
             loss_val = (pred.flatten(1) - y_flat).pow(2).sum(-1)
             grad_x = torch.autograd.grad(loss_val.sum(), x_in)[0]
 
@@ -270,9 +275,7 @@ def hybrid_sample(net, classifier, forward_op, observation, scheduler,
                 loss_val = residual.pow(2).flatten(1).sum(-1)
         else:
             # Surrogate: classifier replaces A
-            pred = classifier(
-                x_in / scaling, sigma_t, None,
-                denoised=denoised)
+            pred = classifier(denoised)
             loss_val = (pred.flatten(1) - y_flat).pow(2).sum(-1)
 
         grad_x = torch.autograd.grad(loss_val.sum(), x_in)[0]

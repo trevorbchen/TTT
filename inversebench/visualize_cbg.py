@@ -82,9 +82,7 @@ def cbg_sample(net, classifier, forward_op, obs, scheduler,
             net.requires_grad_(True)
             denoised = net(x_in / scaling, sigma_t)
 
-            pred = classifier(
-                x_in / scaling, sigma_t, None,
-                denoised=denoised)
+            pred = classifier(denoised)
             loss_val = (pred.flatten(1) - y_flat).pow(2).sum(-1)
             grad_x = torch.autograd.grad(loss_val.sum(), x_in)[0]
 
