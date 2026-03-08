@@ -1822,7 +1822,7 @@ def save_classifier(classifier, path, metadata=None):
             'arch': 'unet_surrogate',
             'img_resolution': classifier.img_resolution,
             'img_channels': classifier.img_channels,
-            'obs_shape': list(classifier.obs_shape),
+            'obs_shape': list(classifier.obs_shape) if classifier.obs_shape is not None else None,
             'meas_flat_dim': classifier.meas_flat_dim,
             'base_channels': classifier.base_channels,
             'channel_mult': list(classifier.channel_mult),
