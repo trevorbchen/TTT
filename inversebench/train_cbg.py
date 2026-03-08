@@ -1282,7 +1282,9 @@ def main(config: DictConfig):
                         else:
                             raw_target = y_hat - y_rep  # predict residual
                         # Flatten to measurement space
-                        if hasattr(classifier, 'measurement_decoder') and classifier.measurement_decoder is not None:
+                        if is_fwi:
+                            target = raw_target  # keep image shape [B, 1, H, W]
+                        elif hasattr(classifier, 'measurement_decoder') and classifier.measurement_decoder is not None:
                             if raw_target.is_complex():
                                 target = torch.view_as_real(raw_target).flatten(1).float()
                             else:
@@ -1484,7 +1486,9 @@ def main(config: DictConfig):
                                     raw_tv = y_hv
                                 else:
                                     raw_tv = y_hv - y_bv
-                                if hasattr(classifier, 'measurement_decoder') and classifier.measurement_decoder is not None:
+                                if is_fwi:
+                                    tv = raw_tv  # keep image shape
+                                elif hasattr(classifier, 'measurement_decoder') and classifier.measurement_decoder is not None:
                                     if raw_tv.is_complex():
                                         tv = torch.view_as_real(raw_tv).flatten(1).float()
                                     else:

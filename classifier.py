@@ -699,22 +699,27 @@ class UNetSurrogate(nn.Module):
             self.dec_blocks.append(level_blocks)
             dec_prev_ch = dec_out_ch
 
-        # --- Output: norm -> adaptive pool -> MLP head ---
-        # Pool to 8x8 to preserve spatial info (C*8*8 >> C after global avg pool)
+        # --- Output head ---
         self.out_norm = nn.GroupNorm(min(32, C), C)
-        pool_size = 8
-        pool_dim = C * pool_size * pool_size  # e.g. 64*8*8 = 4096
-        hidden = min(pool_dim, 2048)
-        self.pool = nn.AdaptiveAvgPool2d(pool_size)
-        self.head = nn.Sequential(
-            nn.Flatten(1),
-            nn.Linear(pool_dim, hidden),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden, meas_flat_dim),
-        )
-        nn.init.normal_(self.head[-1].weight, std=0.01)
-        nn.init.zeros_(self.head[-1].bias)
+        self._image_output = (meas_flat_dim is None)
+        if self._image_output:
+            # Image output: conv 1x1 -> [B, img_channels, H, W]
+            self.out_conv = zero_module(nn.Conv2d(C, img_channels, 1))
+        else:
+            # Flat vector output: pool -> MLP -> [B, meas_flat_dim]
+            pool_size = 8
+            pool_dim = C * pool_size * pool_size
+            hidden = min(pool_dim, 2048)
+            self.pool = nn.AdaptiveAvgPool2d(pool_size)
+            self.head = nn.Sequential(
+                nn.Flatten(1),
+                nn.Linear(pool_dim, hidden),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(hidden, meas_flat_dim),
+            )
+            nn.init.normal_(self.head[-1].weight, std=0.01)
+            nn.init.zeros_(self.head[-1].bias)
 
     def forward(self, x_t, sigma, y, denoised=None):
         """
@@ -753,8 +758,10 @@ class UNetSurrogate(nn.Module):
 
         # Output head
         h = F.silu(self.out_norm(h))
-        h = self.pool(h)          # [B, C, 8, 8]
-        return self.head(h)       # [B, meas_flat_dim]
+        if self._image_output:
+            return self.out_conv(h)   # [B, img_channels, H, W]
+        h = self.pool(h)              # [B, C, 8, 8]
+        return self.head(h)           # [B, meas_flat_dim]
 
 
 # ---------------------------------------------------------------------------
