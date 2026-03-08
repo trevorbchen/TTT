@@ -1397,6 +1397,25 @@ def main(config: DictConfig):
                 running_count += 1
                 global_step += 1
 
+                # One-time gradient flow diagnostic for FWI
+                if is_fwi and global_step == resume_step + 1:
+                    classifier.eval()
+                    x_test = x0.detach().clone().requires_grad_(True)
+                    with torch.enable_grad():
+                        pred_test = classifier(x_test, sigma[:1], None, denoised=x_test)
+                        fake_target = torch.zeros_like(pred_test)
+                        loss_test = (pred_test - fake_target).pow(2).sum()
+                        grad_test = torch.autograd.grad(loss_test, x_test)[0]
+                    logger.log(f"  [FWI Grad Check] pred_norm={pred_test.norm().item():.4f} | "
+                               f"grad_norm={grad_test.norm().item():.6f} | "
+                               f"grad_abs_mean={grad_test.abs().mean().item():.6f} | "
+                               f"grad_max={grad_test.abs().max().item():.6f}")
+                    if grad_test.norm().item() < 1e-8:
+                        logger.log("  [FWI Grad Check] WARNING: gradient near zero!")
+                    else:
+                        logger.log("  [FWI Grad Check] Gradients flowing OK")
+                    classifier.train()
+
                 pbar.set_postfix(
                     step=f"{global_step}/{total_steps}",
                     loss=f"{loss_val:.4f}",
